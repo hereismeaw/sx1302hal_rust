@@ -1,0 +1,9 @@
+sx1302hal_rust
+
+Register addresses, bitfields, AGC/ARB firmware blobs, SPI mux values, and
+mailbox sequences are copied from Semtech sx1302_hal v2.1.0
+(commit 4b42025d1751e04632c0b04160e0d29dbbb222a5), Revised BSD License.
+See firmware/README.md and upstream https://github.com/Lora-net/sx1302_hal
+
+The Rust implementation, GPIO safety policy, AS923-1 bring-up, and CLI/daemon
+are original work under MIT OR Apache-2.0.

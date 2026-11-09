@@ -1,0 +1,12 @@
+[Unit]
+Description=Native SX1302 concentrator daemon (not enabled until RX/TX HAL complete)
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+ExecStart=/usr/local/bin/sx1302-daemon
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

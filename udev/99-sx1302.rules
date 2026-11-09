@@ -1,0 +1,2 @@
+# SPI/I2C already in spi/i2c groups on Raspberry Pi OS. Placeholder for future USB ACM.
+SUBSYSTEM=="spidev", GROUP="spi", MODE="0660"

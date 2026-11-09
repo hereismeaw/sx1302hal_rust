@@ -1,0 +1,10 @@
+[package]
+name = "sx1302-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared types, errors, and board-independent HAL primitives"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true

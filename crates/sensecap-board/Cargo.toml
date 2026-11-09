@@ -1,0 +1,13 @@
+[package]
+name = "sensecap-board"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sx1302-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gpiocdev = "0.7"

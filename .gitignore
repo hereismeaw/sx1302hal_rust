@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+**/.pio
+**/.vscode
+*.pdb
+*.elf
+.DS_Store

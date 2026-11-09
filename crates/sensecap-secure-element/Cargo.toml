@@ -1,0 +1,12 @@
+[package]
+name = "sensecap-secure-element"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sx1302-core.workspace = true
+serde.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true

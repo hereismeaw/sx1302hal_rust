@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sx1302-core",
+    "crates/sx1302-transport",
+    "crates/sx1302-registers",
+    "crates/sx1302-radio",
+    "crates/sx1302-firmware",
+    "crates/sx1302-timestamp",
+    "crates/sx1302-hal",
+    "crates/sx126x-radio",
+    "crates/sensecap-board",
+    "crates/sensecap-secure-element",
+    "crates/sensecap-button",
+    "crates/sensecap-led",
+    "crates/sx1302-testkit",
+    "apps/sx1302-cli",
+    "apps/sx1302-bench",
+    "apps/sx1302-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hereismeaw/sx1302hal_rust"
+rust-version = "1.85"
+
+[workspace.dependencies]
+sx1302-core = { path = "crates/sx1302-core" }
+sx1302-transport = { path = "crates/sx1302-transport" }
+sx1302-registers = { path = "crates/sx1302-registers" }
+sx1302-radio = { path = "crates/sx1302-radio" }
+sx1302-firmware = { path = "crates/sx1302-firmware" }
+sx1302-timestamp = { path = "crates/sx1302-timestamp" }
+sx1302-hal = { path = "crates/sx1302-hal" }
+sx126x-radio = { path = "crates/sx126x-radio" }
+sensecap-board = { path = "crates/sensecap-board" }
+sensecap-secure-element = { path = "crates/sensecap-secure-element" }
+sensecap-button = { path = "crates/sensecap-button" }
+sensecap-led = { path = "crates/sensecap-led" }
+sx1302-testkit = { path = "crates/sx1302-testkit" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+nix = { version = "0.30", features = ["ioctl", "fs"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+panic = "abort"

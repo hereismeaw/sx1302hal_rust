@@ -1,0 +1,18 @@
+[package]
+name = "sx1302-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+serde_json.workspace = true
+sensecap-board.workspace = true
+sx1302-hal.workspace = true
+sx1302-transport.workspace = true
+sx1302-core.workspace = true
+sx1302-firmware.workspace = true
+sensecap-secure-element.workspace = true
+sx126x-radio.workspace = true
+sensecap-led.workspace = true
+sensecap-button.workspace = true

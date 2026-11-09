@@ -1,0 +1,16 @@
+[package]
+name = "sx1302-hal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sx1302-core.workspace = true
+sx1302-transport.workspace = true
+sx1302-registers.workspace = true
+sx1302-radio.workspace = true
+sx1302-firmware.workspace = true
+sx1302-timestamp.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
