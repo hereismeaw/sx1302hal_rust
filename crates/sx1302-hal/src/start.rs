@@ -27,6 +27,10 @@ const RX_TOP: u16 = SX1302_REG_RX_TOP_BASE_ADDR;
 const LSV: u16 = SX1302_REG_RX_TOP_LORA_SERVICE_FSK_BASE_ADDR;
 const RADIO_FE: u16 = SX1302_REG_RADIO_FE_BASE_ADDR;
 const ARB: u16 = SX1302_REG_ARB_MCU_BASE_ADDR;
+/// SX1302 GPIO block (`SX1302_REG_GPIO_*`, base 0x5640).
+const GPIO_DIR_L: u16 = 0x5641;
+const GPIO_OUT_L: u16 = 0x5643;
+const GPIO_SEL_0: u16 = 0x5648;
 
 /// `calculate_freq_to_time_drift`: bw·2^20 / radio_freq, normalised to >= 2048.
 fn freq_to_time_drift(bw_hz: u32, radio_hz: u32) -> (u16, u8) {
@@ -120,6 +124,7 @@ impl Concentrator {
         let mut notes = Vec::new();
         let port = self.bus.sx1302();
 
+        port.write_u8(GPIO_OUT_L, 0x00)?; // sx1302_set_gpio(0): LEDs off during start
         radio::host_fe_safe(&port)?;
         for chain in [RfChain::A, RfChain::B] {
             radio::reset_sx1250(&port, chain)?;
@@ -150,6 +155,7 @@ impl Concentrator {
         port.rmw(RX_TOP + 135, 1, 1, 0)?;
         port.write_u8(RX_TOP + 192, 0x00)?;
         port.rmw(RX_TOP + 192, 2, 1, 1)?; // LEGACY_TIMESTAMP
+        Self::config_gpio(&port)?;
         let common_gen = Self::common_gen(plan);
         port.write_u8(COMMON_GEN, common_gen)?;
         notes.push(format!(
@@ -204,6 +210,8 @@ impl Concentrator {
         port.rmw(SX1302_REG_COMMON_BASE_ADDR + 2, 1, 1, 0)?;
         port.rmw(SX1302_REG_COMMON_BASE_ADDR + 2, 3, 1, 0)?;
         port.rmw(RX_TOP + 135, 1, 1, 0)?;
+        port.write_u8(GPIO_OUT_L, 0x01)?; // CONFIG_DONE -> "Config" LED on
+        notes.push("HAT LEDs: GPIO0 CONFIG_DONE on, GPIO2 TX ON, GPIO4 RX toggle".into());
         let rssi_a = port.read_u8(RADIO_FE + 5)?;
         let rssi_dec = port.read_u8(RADIO_FE + 4)?;
         let rf_en_a = port.read_u8(0x5783)?;
@@ -358,6 +366,26 @@ impl Concentrator {
         port.write_u8(ARB + 10, 1)?; // resume
         Self::wait_arb(port, 0x00)?;
         Ok(())
+    }
+
+    /// `sx1302_config_gpio`: SX1302 GPIOs drive the WM1302 HAT LEDs.
+    /// GPIO0 = CONFIG_DONE (register), GPIO2 = TX ON, GPIO4 = RX toggle (status),
+    /// GPIO7 = AGC (LBT input), others register-driven; direction 0x7F.
+    fn config_gpio(port: &ConcentratorPort<'_>) -> Result<()> {
+        const REGISTER: u8 = 0x00;
+        const AGC: u8 = 0x01;
+        const STATUS: u8 = 0x09;
+        let sel = [REGISTER, REGISTER, STATUS, REGISTER, STATUS, REGISTER, REGISTER, AGC];
+        for (i, s) in sel.iter().enumerate() {
+            port.write_u8(GPIO_SEL_0 + i as u16, *s)?;
+        }
+        port.write_u8(GPIO_DIR_L, 0x7F)?;
+        Ok(())
+    }
+
+    /// Drive the HAT "Config" LED (SX1302 GPIO0).
+    pub fn set_config_led(&self, on: bool) -> Result<()> {
+        self.bus.sx1302().rmw(GPIO_OUT_L, 0, 1, u8::from(on))
     }
 
     /// COMMON_GEN: GLOBAL_EN | CONCENTRATOR | FSK (if planned) | MBWSSF (if planned).

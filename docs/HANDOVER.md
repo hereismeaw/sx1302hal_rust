@@ -148,6 +148,10 @@ RX FIFO parser (`loragw_sx1302_rx.c`): sync `A5 C0`, head 9 + payload + tail 14,
 - **Watchdog**: unit is `Type=notify`, `WatchdogSec=30`. The daemon sends READY=1, then WATCHDOG=1 every 15 s only after a health check (SPI `COMMON_VERSION`=0x10 and 32 MHz counter advancing); a failed check exits → restart with GPIO reset. Verified: SIGSTOP → `Watchdog timeout` → restart → PULL_ACK. `systemctl status` shows STATUS (server link, JIT queue, board temperature).
 - **RSSI temperature compensation**: STTS751 found at I2C-1 0x39 (man 0x53, prod 0x00; read-only use). `rssi_offset` / `rssi_tcomp` per radio in the plan (Semtech defaults), applied like `loragw_hal.c` (+1.77 dB at 39 °C).
 
+## WM1302 HAT LEDs (2026-11-09)
+
+Seeed wiki lists Power (green), Config (red), TX (green), RX (blue) but no Pi GPIO for them — they hang off **SX1302 GPIOs**, configured like Semtech `sx1302_config_gpio`: GPIO0 = CONFIG_DONE (register, set at end of `start`), GPIO2 = TX ON, GPIO4 = RX toggle (hardware status), GPIO7 = AGC/LBT input, DIR_L = 0x7F. `Concentrator::set_config_led(bool)` drives Config. Visual confirmation on the unit pending (SenseCAP M1 enclosure may hide the HAT LEDs). The M1 front-panel LED, if separate, is still unmapped.
+
 ## Next operator steps
 
 1. `gpio reset` then `start --region AS923-1` on the Pi; confirm AGC handshake (no timeout).
