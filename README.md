@@ -1,108 +1,154 @@
 # sx1302hal_rust
 
-Native **Rust** HAL for Semtech **SX1302 / SX1303** (WM1302 SPI) on Raspberry Pi.
-No C HAL and no FFI at runtime.
+A LoRa concentrator HAL for the Semtech SX1302, written in Rust from scratch.
+It talks to the chip over `spidev` directly. There's no C HAL underneath and no FFI.
 
-Pinned to Semtech `sx1302_hal` **v2.1.0**
-(`4b42025d1751e04632c0b04160e0d29dbbb222a5`).
+I built this on one particular box: a Raspberry Pi 5 inside an original
+SenseCAP M1 (WM1302 SPI module), running in Thailand on **AS923-1**
+(920–925 MHz). It now runs that gateway day to day against ChirpStack. If you
+have a different carrier board or region, expect to do some work.
 
-Lab hardware: Raspberry Pi 5 + original SenseCAP M1 (WM1302 SPI), region **AS923-1** (920–925 MHz).
+Everything chip-specific (register addresses, the AGC/ARB firmware, SPI
+framing, the timing and RSSI formulas) is taken from Semtech's published
+`sx1302_hal` v2.1.0 (`4b42025`). None of the register values are guessed.
 
-## Status — not fully tested
+## What works
 
-This is an **early, hardware-lab HAL**. It is **not** a drop-in replacement for Semtech `libloragw` on every board or region.
+Tested on the real hardware with a LilyGO T-Beam as the node:
 
-**Exercised on one SenseCAP M1 + Pi 5 + T-Beam (AS923-1):** SPI detect, GPIO reset, SX1250 clock, OTP EUI, AGC/ARB load (fw 10 / 2), 8×125 kHz RX, live OTA RX/TX with T-Beam, legacy PPS counters, LoRa service + FSK config, SX126 LBT RSSI sample, LED GPIO22, pairing button GPIO27.
+- Bring-up: GPIO reset, both SX1250 radios, AGC/ARB firmware load, OTP EUI.
+- RX on 8 multi-SF channels split over both radios, plus a LoRa "service"
+  channel (e.g. SF7/BW250) and an FSK 50 kb/s channel. The channel plan is a
+  JSON file.
+- TX of LoRa (SF5–12, BW125/250/500) and FSK, either immediately or at a
+  given concentrator timestamp. Power comes from the Semtech SX1250 gain
+  table (12–27 dBm), so `powe` from the network server is respected.
+- A GWMP / Semtech UDP forwarder (`sx1302-daemon`) with a just-in-time
+  downlink queue. It answers `TOO_LATE`, `TOO_EARLY` and `COLLISION_PACKET`
+  the way `lora_pkt_fwd` does.
+- OTAA join, confirmed uplinks and application downlinks through ChirpStack v4.
+- 32-bit `tmst`, decode-latency timestamp correction per SF, and RSSI
+  temperature compensation from the board's STTS751 sensor.
+- The WM1302 HAT LEDs (Config / TX / RX) through the SX1302's own GPIOs.
+- A systemd unit with a watchdog. If the daemon hangs or the chip stops
+  answering, systemd restarts it with a fresh GPIO reset.
 
-**Not finished / not soaked:**
-- ChirpStack (or any LNS) join / downlink loop in production
-- LBT gating of TX (`txpk`)
-- WM1302 TX gain LUT and full image-cal table
-- Fine timestamp (this silicon is SX1302; SX1303-only)
-- GPS 1PPS (counter stays 0 on this carrier)
-- EU868 / US915 full channelizer `start`
-- Spectral scan, Class B beacon, timestamped TX
-- ATECC608 (I2C `0x60` did not respond; writes remain blocked)
-- Multi-HAT GPIO maps (button/LED differ by carrier)
+I also ran Semtech's own `lora_pkt_fwd` on the same board with the same
+channel plan to compare. Downlink timing matched to within 0.01 ms at every
+SF, and RSSI matched for both LoRa and FSK.
 
-Treat `main` as **alpha**. Do not ship RF without your own air and regulatory checks.
+## What doesn't (yet)
 
-## Why this is better than the C HAL
+- **No GPS on this carrier**, so there's no PPS, no `tmms` scheduling and no
+  Class B.
+- **Fine timestamps** are SX1303-only. This unit is an SX1302.
+- **LBT / spectral scan** through the SX1262 isn't wired up. Its chip select
+  shares SPI0 CE0 on the M1, so it needs a device-tree overlay first. Thailand
+  doesn't require LBT.
+- **Only AS923-1 is set up end to end.** The plan format works for other
+  regions, but nobody has tested one.
+- **ATECC608** is inspect-only. It didn't answer on this unit, and every
+  write or lock path is blocked on purpose.
 
-| Topic | Semtech `libloragw` | This crate |
-|---|---|---|
-| Language | C, global COM handle | Rust, `Concentrator` owns the SPI fd |
-| Register map | `loregs[1044]` + `#define` IDs | Same 1044 fields, typed `Field`, pack/unpack tested |
-| Errors | `int` / `fprintf` | `Result` + `thiserror` |
-| SPI | 1-byte RMW, small bursts | Same protocol; Linux burst capped at **1024** (avoids `EMSGSIZE`) |
-| Region | Caller must get it right | TX refused without `--region`; AS923-1 band-checked |
-| GPIO | Board scripts (`reset_lgw.sh`) | SenseCAP map: GPIO18 POWER_EN, 17 RESET, 5 SX126 RESET. **GPIO13 never driven** |
-| Aux radio | `SPI_NO_CS` (fails on bcm2712) | LBT via `/dev/spidev0.1` + GPIO6 CS |
-| Fine timestamp | Silent on SX1302 | Refused when OTP model is SX1302 |
-| ATECC | Helium lock/write in other stacks | Inspect-only; lock/write blocked |
-| Packet path | C packet forwarder | `sx1302-daemon` GWMP UDP (`PUSH_DATA` / `PULL_DATA` / `txpk`) |
-| Tests | Sparse | Protocol + bitfield + region unit tests |
+Please check your own RF output and local regulations before you transmit
+with this.
 
-Register **addresses are not invented**. They are the published Semtech table.
+## Hardware notes (SenseCAP M1)
 
-## Crates
+| What | Where |
+|---|---|
+| SX1302 SPI | `/dev/spidev0.0`, mode 0, 2 MHz |
+| SX1302 power enable | BCM 18 (high) |
+| SX1302 reset | BCM 17 (active-high pulse) |
+| SX1262 reset | BCM 5 (active-low pulse) |
+| Pairing button | BCM 27 (active high) |
+| Temperature sensor | STTS751, I2C-1 `0x39` |
+| HAT LEDs | SX1302 GPIO0 (Config), GPIO2 (TX), GPIO4 (RX) |
+| **BCM 13** | AD5338R DAC: **never driven** by this code |
 
-- `sx1302-registers` — full `loragw_reg.c` map (1044 fields) + IF/freq formulas
-- `sx1302-transport` — Linux `spidev` SPI_IOC_MESSAGE, mux `00/01/02`
-- `sx1302-hal` — detect, bringup, `start` AS923-1, RX FIFO, TX_TOP_A, timestamps
-- `sx1302-firmware` — AGC/ARB blobs (version 10 / 2)
-- `sx1302-radio` — SX1250 opcodes
-- `sx126x-radio` — identify + LBT RSSI (no SX126 TX)
-- `apps/sx1302-cli`, `sx1302-daemon`, `sx1302-bench`
+Two things that cost me time:
 
-## Build
+- **Radio B must be in differential input mode.** In single-input mode it
+  still decodes, but about 40 dB deaf.
+- The old hard-coded TX power sat above the top of Semtech's gain table. That
+  caused CRC errors at short range. The gain table fixed it.
+
+## Building
+
+On the Pi (Rust 1.85 or newer):
 
 ```bash
-# on the Pi (rustc 1.85+)
 source "$HOME/.cargo/env"
-cargo test -p sx1302-registers -p sx1302-core -p sx1302-timestamp
+cargo test --workspace
 cargo build --release -p sx1302-cli -p sx1302-daemon
 ```
 
-## Hardware loop (SenseCAP M1)
+## Trying it by hand
 
-```text
+```bash
 sudo ./target/release/sx1302-cli gpio reset
 sudo ./target/release/sx1302-cli detect
 sudo ./target/release/sx1302-cli start --region AS923-1
 sudo ./target/release/sx1302-cli rx --seconds 10
 sudo ./target/release/sx1302-cli tx-pkt --region AS923-1 --payload 47573031
-sudo ./target/release/sx1302-cli timestamp
-sudo ./target/release/sx1302-cli lbt --freq 923200000
-sudo ./target/release/sx1302-daemon --server chirpstack.example:1700
 ```
 
-GPIO13 (AD5338R) is never opened. GPIO18 is POWER_EN on this carrier (not Seeed BUSY).
-
-## Register API
-
-```rust
-use sx1302_registers::{field, pack_into_byte, unpack_from_byte, ids};
-
-let f = field(ids::COMMON_CTRL1_SWAP_IQ_RADIO_A)?; // addr 0x5602 bit 1
-let byte = pack_into_byte(f, 0x00, 1)?;            // -> 0x02
-assert_eq!(unpack_from_byte(f, byte)?, 1);
-```
-
-Regenerate the table after bumping the Semtech pin:
+## Running it as a gateway
 
 ```bash
-python tools/gen_loregs.py
+sudo install -m755 target/release/sx1302-daemon target/release/sx1302-cli /usr/local/bin/
+sudo install -m644 configs/sx1302-daemon.json /etc/sx1302-daemon.json
+echo 'SX1302_SERVER=your-chirpstack:1700' | sudo tee /etc/default/sx1302-daemon
+sudo install -m644 systemd/sx1302-daemon.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now sx1302-daemon
+
+systemctl status sx1302-daemon      # status line shows server link, queue, board temperature
+journalctl -u sx1302-daemon -f
 ```
 
-## Contributors
+[`configs/sx1302-daemon.json`](configs/sx1302-daemon.json) holds the channel
+plan: radio centre frequencies, the 8 multi-SF channels, the service and FSK
+channels, and optionally `tx_gain_lut`, `rssi_offset` and `rssi_tcomp`. The
+default plan matches ChirpStack's `as923` region (923.2/923.4 MHz plus
+922.6–924.0 MHz).
 
-GitHub counts commits whose **author email is a verified address on the GitHub account**.
-This repo is authored as **[@hereismeaw](https://github.com/hereismeaw)** (`Kittiwut Khongkaeo`).
+The daemon holds the SPI bus. Stop the service before using `sx1302-cli`.
 
+## Test tools
+
+- [`tools/tbeam-as923-node`](tools/tbeam-as923-node): T-Beam firmware that
+  cycles through both radios, SF7–12, BW250 and FSK, then prints when each
+  downlink actually arrived.
+- [`tools/gwmp_echo_ns.py`](tools/gwmp_echo_ns.py): a tiny fake network server
+  that answers each test uplink at +1 s / +2 s.
+- [`tools/tbeam-otaa-node`](tools/tbeam-otaa-node): a real LoRaWAN 1.0.3 OTAA
+  node (RadioLib). Put your keys in `src/keys.h`; that file is git-ignored.
+- [`tools/semtech-ref`](tools/semtech-ref): how to build and run Semtech's
+  `lora_pkt_fwd` on the same board for an A/B comparison.
+
+[`docs/HANDOVER.md`](docs/HANDOVER.md) has the detailed notes and the
+measurements behind the claims above.
+
+## Layout
+
+| Crate | What's in it |
+|---|---|
+| `sx1302-registers` | Semtech's full register table (1044 fields) and frequency helpers |
+| `sx1302-transport` | `spidev` access and the SX1302 SPI mux protocol |
+| `sx1302-hal` | Start-up, channel plan, RX parsing, TX, timestamps, LEDs |
+| `sx1302-radio` | SX1250 commands |
+| `sx1302-firmware` | AGC/ARB firmware blobs |
+| `sensecap-board` | M1 GPIO reset and the STTS751 sensor |
+| `sx126x-radio`, `sensecap-*` | Aux radio, button, LED and secure-element bits |
+| `apps/` | `sx1302-cli`, `sx1302-daemon`, `sx1302-bench` |
+
+After bumping the Semtech version, regenerate the register table with
+`python tools/gen_loregs.py`.
+
+## Credits and license
+
+Written by [@hereismeaw](https://github.com/hereismeaw) (Kittiwut Khongkaeo).
 See [CONTRIBUTORS.md](CONTRIBUTORS.md).
 
-## License
-
-Rust code: MIT OR Apache-2.0.  
-Semtech firmware and register table: Revised BSD (see `NOTICE` and `firmware/`).
+The Rust code is MIT OR Apache-2.0. Semtech's firmware and register table stay
+under their Revised BSD license (see `NOTICE` and `firmware/`).
