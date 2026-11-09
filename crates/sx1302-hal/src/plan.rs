@@ -59,6 +59,40 @@ pub struct FskChan {
     pub sync_word_size: u8,
 }
 
+fn default_rssi_offset() -> [f32; 2] {
+    [-215.4, -215.4]
+}
+
+/// `struct lgw_rssi_tcomp_s`: offset(T) = (a·T⁴ + b·T³ + c·T² + d·T + e) / 2¹⁶ dB.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RssiTcomp {
+    pub coeff_a: f32,
+    pub coeff_b: f32,
+    pub coeff_c: f32,
+    pub coeff_d: f32,
+    pub coeff_e: f32,
+}
+
+impl Default for RssiTcomp {
+    /// Semtech `global_conf.json.sx1250.*` reference values.
+    fn default() -> Self {
+        Self { coeff_a: 0.0, coeff_b: 0.0, coeff_c: 20.41, coeff_d: 2162.56, coeff_e: 0.0 }
+    }
+}
+
+impl RssiTcomp {
+    /// `sx1302_rssi_get_temperature_offset`.
+    pub fn offset_db(&self, t: f32) -> f32 {
+        let t = f64::from(t);
+        ((f64::from(self.coeff_a) * t.powi(4)
+            + f64::from(self.coeff_b) * t.powi(3)
+            + f64::from(self.coeff_c) * t.powi(2)
+            + f64::from(self.coeff_d) * t
+            + f64::from(self.coeff_e))
+            / 65536.0) as f32
+    }
+}
+
 /// Semtech reference (`global_conf.json.sx1250.*`) leaves both radios differential.
 /// Measured on WM1302 / SenseCAP M1 (2026-11-09): radio B in single-input mode
 /// reads ~40 dB low (-83 vs -42 dBm, same node); radio A is identical either way.
@@ -73,13 +107,19 @@ fn default_sync_word_size() -> u8 {
     3
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChannelPlan {
     /// SX1250 A / B RX centre frequencies.
     pub radio_hz: [u32; 2],
     /// Semtech `single_input_mode` per radio (SX1250 RF input single-ended).
     #[serde(default = "default_single_input")]
     pub single_input_mode: [bool; 2],
+    /// Board RSSI calibration per radio (`rssi_offset`, dB).
+    #[serde(default = "default_rssi_offset")]
+    pub rssi_offset: [f32; 2],
+    /// RSSI temperature compensation per radio (`rssi_tcomp`).
+    #[serde(default)]
+    pub rssi_tcomp: [RssiTcomp; 2],
     /// Up to 8 multi-SF BW125 chains (if_chain 0..7).
     pub multisf: Vec<MultiSfChan>,
     /// if_chain 8.
@@ -116,6 +156,8 @@ impl ChannelPlan {
         Self {
             radio_hz: [a, b],
             single_input_mode: default_single_input(),
+            rssi_offset: default_rssi_offset(),
+            rssi_tcomp: [RssiTcomp::default(); 2],
             multisf,
             lora_std: None,
             fsk: None,
@@ -213,6 +255,14 @@ mod tests {
         p.validate(Region::As923_1).unwrap();
         assert_eq!(p.if_hz(0, 922_600_000), -300_000);
         assert_eq!(p.if_hz(1, 924_000_000), 300_000);
+    }
+
+    #[test]
+    fn tcomp_reference() {
+        let t = RssiTcomp::default();
+        assert_eq!(t.offset_db(0.0), 0.0);
+        // (20.41*39.125^2 + 2162.56*39.125) / 65536
+        assert!((t.offset_db(39.125) - 1.7678).abs() < 0.001, "{}", t.offset_db(39.125));
     }
 
     #[test]

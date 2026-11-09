@@ -66,6 +66,26 @@ impl Concentrator {
         Ok(self.ts.lock().unwrap().update(raw))
     }
 
+    /// Liveness probe for a watchdog: SPI answers with `COMMON_VERSION` 0x10 and the
+    /// 32 MHz counter has advanced since `prev_us` (a stopped radio clock freezes it).
+    /// Returns the current `tmst`.
+    pub fn health_check(&self, prev_us: Option<u32>) -> Result<u32> {
+        let v = self
+            .bus
+            .sx1302()
+            .read_u8(sx1302_core::SX1302_REG_COMMON_VERSION)?;
+        if v != sx1302_core::SX1302_VERSION_EXPECTED {
+            return Err(HalError::Other(format!("COMMON_VERSION 0x{v:02x}")));
+        }
+        let now = self.now_us()?;
+        if let Some(p) = prev_us {
+            if now == p {
+                return Err(HalError::Other("concentrator counter not advancing".into()));
+            }
+        }
+        Ok(now)
+    }
+
     pub(crate) fn expand_pkt_ts(&self, pkt_raw: u32) -> u32 {
         self.ts.lock().unwrap().expand_pkt(pkt_raw)
     }

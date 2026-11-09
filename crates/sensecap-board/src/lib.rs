@@ -1,6 +1,8 @@
 //! SenseCAP M1 carrier vs official WM1302 Pi HAT pin models.
 //! GPIO character-device identifiers only. Unverified lines cannot be driven.
 
+pub mod temp;
+
 use serde::{Deserialize, Serialize};
 use sx1302_core::VerificationStatus;
 use std::fs;

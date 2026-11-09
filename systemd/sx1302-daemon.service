@@ -4,7 +4,11 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+# Daemon pings every WatchdogSec/2 only while SPI + 32 MHz counter are healthy.
+WatchdogSec=30
+TimeoutStartSec=60
 # GPIO reset (gpiochip0 / pinctrl) + /dev/spidev0.0 need root on this image.
 User=root
 EnvironmentFile=-/etc/default/sx1302-daemon

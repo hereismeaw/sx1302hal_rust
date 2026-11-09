@@ -11,3 +11,4 @@ serde_json.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gpiocdev = "0.7"
+libc.workspace = true

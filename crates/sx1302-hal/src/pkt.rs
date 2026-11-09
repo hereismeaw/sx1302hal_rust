@@ -567,12 +567,18 @@ impl Concentrator {
         let n = (nb as usize).min(4096);
         let mut buf = vec![0u8; n];
         port.read_burst(RX_RAM, &mut buf)?;
-        let (chains, multisf_radio) = {
+        let temperature = *self.temperature.lock().unwrap();
+        let (chains, multisf_radio, rssi_adj) = {
             let plan = self.plan.lock().unwrap();
             let radios: Vec<u8> = plan.multisf.iter().map(|c| c.radio).collect();
             let std_radio = plan.lora_std.map(|s| s.radio).unwrap_or(0);
             let fsk_radio = plan.fsk.map(|f| f.radio).unwrap_or(0);
-            (plan.chain_map(), (radios, std_radio, fsk_radio))
+            // loragw_hal.c: rssi += rssi_offset + tcomp(T) per rf_chain
+            let adj = |r: usize| {
+                plan.rssi_offset[r] - RSSI_OFFSET_SX1250
+                    + temperature.map_or(0.0, |t| plan.rssi_tcomp[r].offset_db(t))
+            };
+            (plan.chain_map(), (radios, std_radio, fsk_radio), [adj(0), adj(1)])
         };
         let packets = parse_rx_buffer(&buf, &chains)
             .into_iter()
@@ -584,6 +590,11 @@ impl Concentrator {
                     8 => multisf_radio.1,
                     _ => multisf_radio.2,
                 };
+                let a = rssi_adj[usize::from(p.rf_chain & 1)];
+                p.rssi_chan += a;
+                if p.modulation == RxModulation::Lora {
+                    p.rssi_sig += a;
+                }
                 p
             })
             .collect();

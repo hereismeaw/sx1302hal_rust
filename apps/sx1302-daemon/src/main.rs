@@ -2,6 +2,7 @@
 //! with a JIT downlink queue and a JSON channel plan.
 
 mod jit;
+mod notify;
 
 use clap::Parser;
 use jit::JitQueue;
@@ -111,7 +112,47 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_stat = Instant::now();
     let mut last_pull = Instant::now() - Duration::from_secs(10);
     let mut pull_acked = false;
+    // systemd watchdog: ping at half the interval, only after a passing health check.
+    let wd_every = notify::watchdog_interval().map(|d| d / 2);
+    let mut last_health = Instant::now();
+    let mut health_ts = Some(c.health_check(None)?);
+    let mut last_server_ack = Instant::now();
+    // Board temperature (STTS751 @ I2C-1 0x39) for RSSI temperature compensation.
+    let temp_sensor = match sensecap_board::temp::Stts751::open() {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("temperature sensor: {e} (RSSI temperature compensation off)");
+            None
+        }
+    };
+    let read_temp = |c: &Concentrator| -> Option<f32> {
+        let t = temp_sensor.as_ref()?.temperature_c().ok();
+        c.set_temperature(t);
+        t
+    };
+    if let Some(t) = read_temp(&c) {
+        eprintln!("board temperature {t:.1} °C (STTS751), RSSI tcomp on");
+    }
+    notify::notify("READY=1\nSTATUS=concentrator started");
     loop {
+        if last_health.elapsed() >= wd_every.unwrap_or(Duration::from_secs(10)) {
+            // Err here exits -> systemd restarts -> GPIO reset + full start.
+            health_ts = Some(c.health_check(health_ts).map_err(|e| format!("health check: {e}"))?);
+            last_health = Instant::now();
+            let temp = read_temp(&c);
+            if wd_every.is_some() {
+                let link = if sock.is_none() || last_server_ack.elapsed() < Duration::from_secs(30) {
+                    "server ok"
+                } else {
+                    "no server ACK > 30 s"
+                };
+                let temp = temp.map_or("n/a".into(), |t| format!("{t:.1} °C"));
+                notify::notify(&format!(
+                    "WATCHDOG=1\nSTATUS={link}, jit queue {}, board {temp}",
+                    jit.len()
+                ));
+            }
+        }
         let dump = c.rx_poll()?;
         if !dump.packets.is_empty() {
             st.rxnb += dump.packets.len() as u32;
@@ -196,6 +237,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             while let Ok(n) = s.recv(&mut buf) {
                 if n < 4 || buf[0] != PROTO {
                     continue;
+                }
+                if matches!(buf[3], PKT_PUSH_ACK | PKT_PULL_ACK | PKT_PULL_RESP) {
+                    last_server_ack = Instant::now();
                 }
                 match buf[3] {
                     PKT_PUSH_ACK => st.push_ack += 1,

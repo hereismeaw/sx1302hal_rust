@@ -215,6 +215,7 @@ name = "sensecap-board"
 version = "0.1.0"
 dependencies = [
  "gpiocdev",
+ "libc",
  "serde",
  "serde_json",
  "sx1302-core",

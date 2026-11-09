@@ -21,7 +21,7 @@ pub use pkt::{
 };
 pub use plan::{
     bw_code_to_hz, bw_hz_to_code, ChainKind, ChainMap, ChannelPlan, FskChan, LoraStdChan,
-    MultiSfChan, BW_125KHZ, BW_250KHZ, BW_500KHZ,
+    MultiSfChan, RssiTcomp, BW_125KHZ, BW_250KHZ, BW_500KHZ,
 };
 pub use timestamp::TimestampDump;
 
@@ -31,6 +31,15 @@ pub struct Concentrator {
     plan: std::sync::Mutex<ChannelPlan>,
     /// 27-bit µs counter wrap tracking (`timestamp_counter_t`).
     ts: std::sync::Mutex<timestamp::TsWrap>,
+    /// Board temperature (°C) for RSSI compensation; `None` = no compensation.
+    temperature: std::sync::Mutex<Option<f32>>,
+}
+
+impl Concentrator {
+    /// Feed the board temperature (STTS751) used for `rssi_tcomp`.
+    pub fn set_temperature(&self, t: Option<f32>) {
+        *self.temperature.lock().unwrap() = t;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +58,7 @@ impl Concentrator {
             bus: SpiBus::open(config)?,
             plan: std::sync::Mutex::new(ChannelPlan::as923_1_default()),
             ts: std::sync::Mutex::new(timestamp::TsWrap::default()),
+            temperature: std::sync::Mutex::new(None),
         })
     }
 
