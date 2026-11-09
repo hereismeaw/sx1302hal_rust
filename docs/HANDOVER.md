@@ -153,7 +153,26 @@ RX FIFO parser (`loragw_sx1302_rx.c`): sync `A5 C0`, head 9 + payload + tail 14,
 - **Server outage:** UDP send errors (ECONNREFUSED / ENETUNREACH) are logged (≤ 1 per 30 s) instead of exiting. Test: echo NS up 20 s → down 50 s → up: daemon stayed up, logged `no ACK for 30 s`, then `back after 55 s`, kept receiving RF throughout.
 - **RX2 via ChirpStack:** test hook `SX1302_TEST_REJECT_ALTERNATE_DL=1` (env, off by default, never in the unit) answers TOO_LATE to every other PULL_RESP so ChirpStack falls back to RX2. Result: confirmed uplinks ACKed in RX2 (923.2 MHz SF10, +2 s) 6/6, and **JoinAccept in RX2** (+6 s, 33 B SF10) → join OK.
 - **Reboot:** service back automatically with the watchdog build, NRestarts 0, RX1 downlinks within a minute.
+- **Power cut (unplugged, 2026-11-09 ~17:45):** service came back on its own, NRestarts 0, PULL_ACK and RX1 downlinks within ~1 min. The Pi has no RTC battery, so the system clock is wrong until NTP syncs; downlink timing is unaffected (it uses the SX1302 counter).
 - Not done (weather / equipment): field range, conducted TX power measurement, multi-node load. No Tailscale on the Pi, so the Tailscale path to ChirpStack is untested.
+
+## Soak test in progress (started 2026-11-09 17:52 +07, operator away 2 nights)
+
+Temporary sampler on the Pi, **not part of the repo**:
+
+- `/usr/local/bin/sx1302-soak.sh`, run by `sx1302-soak.timer` / `sx1302-soak.service` (every 10 min, also after boot).
+- Writes one line per run to `/var/log/sx1302-soak.log` (survives reboots; the journal on this Pi is volatile): uptime, active, NRestarts, RSS, downlinks scheduled, TOO_LATE, JIT errors, server lost/back, health failures, systemd status text (server link, JIT queue, board temperature).
+- Baseline: RSS 2.6 MB, restarts 0, no errors. Running against ChirpStack 192.168.0.101 with the T-Beam OTAA node sending a confirmed uplink every 30 s.
+
+What to check when reading it: RSS flat; restarts 0; TOO_LATE / jit_err / health_fail 0; downlink count growing steadily across 32-bit `tmst` wraps (every 71.6 min); compare with the device's frame count in ChirpStack.
+
+Remove after the test:
+
+```bash
+sudo systemctl disable --now sx1302-soak.timer
+sudo rm /etc/systemd/system/sx1302-soak.{timer,service} /usr/local/bin/sx1302-soak.sh
+sudo systemctl daemon-reload
+```
 
 ## WM1302 HAT LEDs (2026-11-09)
 
