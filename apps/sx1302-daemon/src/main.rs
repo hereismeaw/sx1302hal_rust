@@ -1,10 +1,15 @@
-//! AS923-1 concentrator daemon: Semtech GWMP v2 (PUSH_DATA / PULL_DATA / PULL_RESP / TX_ACK).
+//! AS923-1 concentrator daemon: Semtech GWMP v2 (PUSH_DATA / PULL_DATA / PULL_RESP / TX_ACK)
+//! with a JIT downlink queue and a JSON channel plan.
+
+mod jit;
 
 use clap::Parser;
+use jit::JitQueue;
 use sensecap_board::reset_sensecap_m1;
+use serde::Deserialize;
 use serde_json::json;
 use sx1302_core::Region;
-use sx1302_hal::{Concentrator, TxRequest, TxTrigger, BW_125KHZ};
+use sx1302_hal::{bw_hz_to_code, ChannelPlan, Concentrator, FskTx, TxRequest, TxTrigger};
 use sx1302_transport::SpiConfig;
 use std::net::UdpSocket;
 use std::thread;
@@ -13,14 +18,27 @@ use std::time::{Duration, Instant};
 #[derive(Parser)]
 #[command(name = "sx1302-daemon", about = "Native SX1302 GWMP forwarder (AS923-1)")]
 struct Args {
-    /// ChirpStack / Semtech packet-forwarder UDP (`host:port`). Empty = stdout JSON only.
-    #[arg(long, default_value = "")]
-    server: String,
+    /// JSON config (`server`, `stat_interval`, `plan`). See configs/sx1302-daemon.json.
+    #[arg(long)]
+    config: Option<String>,
+    /// ChirpStack / Semtech packet-forwarder UDP (`host:port`). Overrides the config.
+    #[arg(long)]
+    server: Option<String>,
     #[arg(long, default_value = "/dev/spidev0.0")]
     spi: String,
-    /// Seconds between `stat` reports.
-    #[arg(long, default_value_t = 30)]
-    stat_interval: u64,
+    /// Seconds between `stat` reports. Overrides the config.
+    #[arg(long)]
+    stat_interval: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+struct Config {
+    #[serde(default)]
+    server: Option<String>,
+    #[serde(default)]
+    stat_interval: Option<u64>,
+    #[serde(default)]
+    plan: Option<ChannelPlan>,
 }
 
 const PKT_PUSH_DATA: u8 = 0x00;
@@ -51,6 +69,16 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let cfg: Config = match &args.config {
+        Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?)
+            .map_err(|e| format!("config {p}: {e}"))?,
+        None => Config::default(),
+    };
+    let server = args.server.or(cfg.server).unwrap_or_default();
+    let stat_interval = args.stat_interval.or(cfg.stat_interval).unwrap_or(30);
+    let plan = cfg.plan.unwrap_or_else(ChannelPlan::as923_1_default);
+    plan.validate(Region::As923_1)?;
+
     match reset_sensecap_m1() {
         Ok(n) => n.iter().for_each(|l| eprintln!("{l}")),
         Err(e) => eprintln!("gpio: {e}"),
@@ -59,21 +87,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         path: args.spi,
         ..Default::default()
     })?;
-    for line in c.start_as923_1()? {
+    for line in c.start(&plan)? {
         eprintln!("{line}");
     }
     let eui = c.otp_eui().unwrap_or(0);
     eprintln!("gateway EUI {eui:016x}");
-    let sock = if args.server.is_empty() {
+    let sock = if server.is_empty() {
         None
     } else {
         let s = UdpSocket::bind("0.0.0.0:0")?;
         s.set_nonblocking(true)?;
-        s.connect(&args.server)?;
-        eprintln!("PUSH_DATA/PULL_DATA -> {}", args.server);
+        s.connect(&server)?;
+        eprintln!("PUSH_DATA/PULL_DATA -> {server}");
         Some(s)
     };
     let mut st = Stats::default();
+    let mut jit = JitQueue::default();
     let mut token: u16 = 1;
     let mut last_stat = Instant::now();
     let mut last_pull = Instant::now() - Duration::from_secs(10);
@@ -90,7 +119,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut seen: Vec<(u32, &[u8])> = Vec::new();
             ok.retain(|p| {
                 let dup = seen.iter().any(|(t, d)| {
-                    p.count_us.abs_diff(*t) < 1_000 && *d == p.payload.as_slice()
+                    p.count_us.wrapping_sub(*t).min(t.wrapping_sub(p.count_us)) < 1_000
+                        && *d == p.payload.as_slice()
                 });
                 if !dup {
                     seen.push((p.count_us, &p.payload));
@@ -109,8 +139,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+
+        // JIT: arm whatever is due.
+        if jit.len() > 0 {
+            let now = c.now_us()?;
+            while let Some(item) = jit.pop_due(now) {
+                let t0 = Instant::now();
+                match c.send(&item.req) {
+                    Ok(msg) => {
+                        st.txnb += 1;
+                        eprintln!("{msg} [armed in {} µs, queue {}]", t0.elapsed().as_micros(), jit.len());
+                    }
+                    Err(e) => eprintln!("jit arm: {e}"),
+                }
+            }
+        }
+
         if let Some(s) = &sock {
-            if last_stat.elapsed() > Duration::from_secs(args.stat_interval) {
+            if last_stat.elapsed() > Duration::from_secs(stat_interval) {
                 let ackr = if st.push_sent == 0 {
                     100.0
                 } else {
@@ -129,13 +175,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 eprintln!("{stat}");
                 push(s, token, eui, &stat.to_string())?;
-                st.push_sent += 1;
+                st = Stats {
+                    push_sent: st.push_sent + 1,
+                    push_ack: st.push_ack,
+                    ..Stats::default()
+                };
                 token = token.wrapping_add(1);
-                st.rxnb = 0;
-                st.rxok = 0;
-                st.rxfw = 0;
-                st.dwnb = 0;
-                st.txnb = 0;
                 last_stat = Instant::now();
             }
             if last_pull.elapsed() > Duration::from_secs(5) {
@@ -152,7 +197,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     PKT_PUSH_ACK => st.push_ack += 1,
                     PKT_PULL_ACK => {
                         if !pull_acked {
-                            eprintln!("PULL_ACK from {} (downlink path open)", args.server);
+                            eprintln!("PULL_ACK from {server} (downlink path open)");
                             pull_acked = true;
                         }
                     }
@@ -161,15 +206,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let resp_token = u16::from_be_bytes([buf[1], buf[2]]);
                         let json = std::str::from_utf8(&buf[4..n]).unwrap_or("");
                         eprintln!("PULL_RESP {json}");
-                        let err = match handle_txpk(&c, json) {
-                            Ok(msg) => {
-                                eprintln!("{msg}");
-                                st.txnb += 1;
-                                "NONE"
+                        let err = match parse_txpk(json) {
+                            Ok((req, start)) => {
+                                let now = c.now_us()?;
+                                match jit.enqueue(req, start, now) {
+                                    Ok(()) => {
+                                        eprintln!(
+                                            "queued tmst={} (+{} ms), queue {}",
+                                            start.map_or("imme".into(), |t| t.to_string()),
+                                            start.map_or(0, |t| t.wrapping_sub(now) as i32 / 1000),
+                                            jit.len()
+                                        );
+                                        "NONE"
+                                    }
+                                    Err(e) => {
+                                        eprintln!("jit: {}", e.gwmp());
+                                        e.gwmp()
+                                    }
+                                }
                             }
                             Err(e) => {
                                 eprintln!("txpk: {e}");
-                                gwmp_error(&e.to_string())
+                                e
                             }
                         };
                         tx_ack(s, resp_token, eui, err)?;
@@ -178,7 +236,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -199,55 +257,60 @@ fn tx_ack(sock: &UdpSocket, token: u16, eui: u64, error: &str) -> std::io::Resul
     Ok(())
 }
 
-fn gwmp_error(msg: &str) -> &'static str {
-    if msg.contains("TOO_LATE") {
-        "TOO_LATE"
-    } else if msg.contains("TOO_EARLY") {
-        "TOO_EARLY"
-    } else if msg.contains("busy") {
-        "COLLISION_PACKET"
-    } else if msg.contains("band") || msg.contains("Frequency") {
-        "TX_FREQ"
-    } else {
-        "COLLISION_PACKET"
-    }
-}
-
-fn handle_txpk(c: &Concentrator, json: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let v: serde_json::Value = serde_json::from_str(json)?;
-    let tx = v.get("txpk").ok_or("no txpk")?;
-    if tx.get("modu").and_then(|x| x.as_str()).unwrap_or("LORA") != "LORA" {
-        return Err("only LORA modulation".into());
-    }
-    let freq = tx.get("freq").and_then(|x| x.as_f64()).ok_or("no freq")?;
+/// GWMP `txpk` -> request + emission time (`None` = immediate). Errors are GWMP codes.
+fn parse_txpk(json: &str) -> Result<(TxRequest, Option<u32>), &'static str> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|_| "COLLISION_PACKET")?;
+    let tx = v.get("txpk").ok_or("COLLISION_PACKET")?;
+    let freq = tx.get("freq").and_then(|x| x.as_f64()).ok_or("TX_FREQ")?;
     let freq_hz = (freq * 1_000_000.0).round() as u32;
-    let datr = tx.get("datr").and_then(|x| x.as_str()).unwrap_or("SF7BW125");
-    let (sf, bw) = parse_datr(datr).ok_or("bad datr")?;
-    if bw != 125 {
-        return Err(format!("only BW125 supported ({datr})").into());
+    if !Region::As923_1.contains(freq_hz) {
+        return Err("TX_FREQ");
     }
-    let b64 = tx.get("data").and_then(|x| x.as_str()).unwrap_or("");
-    let payload = b64_decode(b64)?;
+    let payload = b64_decode(tx.get("data").and_then(|x| x.as_str()).unwrap_or(""))
+        .map_err(|_| "COLLISION_PACKET")?;
     let imme = tx.get("imme").and_then(|x| x.as_bool()).unwrap_or(false);
-    let trigger = if imme {
-        TxTrigger::Immediate
+    let start = if imme {
+        None
     } else {
-        let t = tx.get("tmst").and_then(|x| x.as_u64()).ok_or("no tmst (GPS time not supported)")?;
-        TxTrigger::Timestamped(t as u32)
+        // GPS `tmms` scheduling needs PPS (not on this carrier).
+        Some(tx.get("tmst").and_then(|x| x.as_u64()).ok_or("GPS_UNLOCKED")? as u32)
     };
-    let req = TxRequest {
-        region: Region::As923_1,
-        freq_hz,
-        sf,
-        bw: BW_125KHZ,
-        cr: 1,
-        payload,
-        power_idx: 22,
-        invert_pol: tx.get("ipol").and_then(|x| x.as_bool()).unwrap_or(false),
-        preamble: tx.get("prea").and_then(|x| x.as_u64()).unwrap_or(8) as u16,
-        trigger,
+    let modu = tx.get("modu").and_then(|x| x.as_str()).unwrap_or("LORA");
+    let mut req = TxRequest::as923_1_sf7(payload).map_err(|_| "TX_FREQ")?;
+    req.freq_hz = freq_hz;
+    req.trigger = match start {
+        None => TxTrigger::Immediate,
+        Some(t) => TxTrigger::Timestamped(t),
     };
-    Ok(c.send_lora(&req)?)
+    match modu {
+        "LORA" => {
+            let datr = tx.get("datr").and_then(|x| x.as_str()).unwrap_or("SF7BW125");
+            let (sf, bw_khz) = parse_datr(datr).ok_or("COLLISION_PACKET")?;
+            req.sf = sf;
+            req.bw = bw_hz_to_code(bw_khz * 1000).ok_or("COLLISION_PACKET")?;
+            req.cr = match tx.get("codr").and_then(|x| x.as_str()).unwrap_or("4/5") {
+                "4/6" => 2,
+                "4/7" => 3,
+                "4/8" => 4,
+                _ => 1,
+            };
+            req.invert_pol = tx.get("ipol").and_then(|x| x.as_bool()).unwrap_or(false);
+            req.preamble = tx.get("prea").and_then(|x| x.as_u64()).unwrap_or(8) as u16;
+        }
+        "FSK" => {
+            let datarate = tx.get("datr").and_then(|x| x.as_u64()).ok_or("COLLISION_PACKET")? as u32;
+            let fdev_hz = tx.get("fdev").and_then(|x| x.as_u64()).unwrap_or(25_000) as u32;
+            req.fsk = Some(FskTx {
+                datarate,
+                fdev_hz,
+                sync_word: 0xC1_94_C1,
+                sync_word_size: 3,
+            });
+            req.preamble = tx.get("prea").and_then(|x| x.as_u64()).unwrap_or(5) as u16;
+        }
+        _ => return Err("COLLISION_PACKET"),
+    }
+    Ok((req, start))
 }
 
 fn parse_datr(d: &str) -> Option<(u8, u32)> {
@@ -256,15 +319,15 @@ fn parse_datr(d: &str) -> Option<(u8, u32)> {
     Some((sf.parse().ok()?, bw.parse().ok()?))
 }
 
-fn b64_decode(s: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    fn val(c: u8) -> Result<u8, Box<dyn std::error::Error>> {
+fn b64_decode(s: &str) -> Result<Vec<u8>, &'static str> {
+    fn val(c: u8) -> Result<u8, &'static str> {
         Ok(match c {
             b'A'..=b'Z' => c - b'A',
             b'a'..=b'z' => c - b'a' + 26,
             b'0'..=b'9' => c - b'0' + 52,
             b'+' => 62,
             b'/' => 63,
-            _ => return Err("bad base64".into()),
+            _ => return Err("bad base64"),
         })
     }
     let bytes: Vec<u8> = s.bytes().filter(|c| *c != b'=' && !c.is_ascii_whitespace()).collect();
@@ -345,5 +408,36 @@ mod tests {
     #[test]
     fn b64() {
         assert_eq!(b64_decode("R1cwMQ==").unwrap(), b"GW01");
+    }
+
+    #[test]
+    fn txpk_lora_and_fsk() {
+        let (r, t) = parse_txpk(
+            r#"{"txpk":{"imme":false,"tmst":5000000,"freq":923.2,"modu":"LORA","datr":"SF10BW125","codr":"4/5","ipol":true,"data":"AQID"}}"#,
+        )
+        .unwrap();
+        assert_eq!((r.sf, r.invert_pol, t), (10, true, Some(5_000_000)));
+        let (r, t) = parse_txpk(
+            r#"{"txpk":{"imme":true,"freq":922.3,"modu":"FSK","datr":50000,"fdev":25000,"data":"AQID"}}"#,
+        )
+        .unwrap();
+        assert_eq!(t, None);
+        assert_eq!(r.fsk.unwrap().datarate, 50_000);
+        assert_eq!(
+            parse_txpk(r#"{"txpk":{"tmst":1,"freq":868.1,"modu":"LORA","datr":"SF7BW125","data":"AQ=="}}"#)
+                .unwrap_err(),
+            "TX_FREQ"
+        );
+    }
+
+    #[test]
+    fn config_parses() {
+        let s = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../configs/sx1302-daemon.json"
+        ))
+        .unwrap();
+        let c: Config = serde_json::from_str(&s).unwrap();
+        c.plan.unwrap().validate(Region::As923_1).unwrap();
     }
 }

@@ -8,7 +8,7 @@ Type=simple
 # GPIO reset (gpiochip0 / pinctrl) + /dev/spidev0.0 need root on this image.
 User=root
 EnvironmentFile=-/etc/default/sx1302-daemon
-ExecStart=/usr/local/bin/sx1302-daemon --server ${SX1302_SERVER}
+ExecStart=/usr/local/bin/sx1302-daemon --config /etc/sx1302-daemon.json --server ${SX1302_SERVER}
 Restart=always
 RestartSec=5
 StandardOutput=null

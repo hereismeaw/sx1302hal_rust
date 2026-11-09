@@ -121,6 +121,12 @@ fn write_reg3(radio: &RadioPort<'_>, a: u8, b: u8, c: u8) -> Result<()> {
 
 /// `sx1250_setup` without image calibration (region not locked). Ends in SET_RX.
 pub fn setup_rx_clock(bus: &SpiBus, chain: RfChain, freq_hz: u32) -> Result<()> {
+    setup_rx(bus, chain, freq_hz, true)
+}
+
+/// `sx1250_setup`: RX at `freq_hz`; `single_input` = Semtech `single_input_mode`
+/// (per radio in `global_conf.json`).
+pub fn setup_rx(bus: &SpiBus, chain: RfChain, freq_hz: u32, single_input: bool) -> Result<()> {
     let radio = bus.radio(chain.mux());
     radio.write_cmd(SET_STANDBY, &[STDBY_RC])?;
     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -165,8 +171,10 @@ pub fn setup_rx_clock(bus: &SpiBus, chain: RfChain, freq_hz: u32) -> Result<()> 
     radio.write_cmd(WRITE_REGISTER, &[0x08, 0x8F, 0x00, 0x00, 0x00])?;
     calibrate_image(&radio, freq_hz)?;
     radio.write_cmd(SET_RX, &[0xFF, 0xFF, 0xFF])?;
-    // WM1302 / SenseCAP M1: SX1250 single-ended RF (Semtech `single_input_mode`).
-    write_reg3(&radio, 0x08, 0xE2, 0x0D)?;
+    if single_input {
+        // SX1250 single-ended RF input (Semtech `single_input_mode`).
+        write_reg3(&radio, 0x08, 0xE2, 0x0D)?;
+    }
     write_reg3(&radio, 0x05, 0x87, 0x0B)?; // FPGA_MODE_RX
     Ok(())
 }

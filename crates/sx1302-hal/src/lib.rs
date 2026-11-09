@@ -12,14 +12,25 @@ use sx1302_radio::{self as radio, RadioStatus, RfChain};
 use sx1302_transport::{ConcentratorPort, SpiBus, SpiConfig};
 
 mod pkt;
+mod plan;
 mod start;
 mod timestamp;
-pub use pkt::{parse_rx_buffer, RxDump, RxPacket, TxRequest, TxTrigger, BW_125KHZ, RSSI_OFFSET_SX1250};
-pub use start::AS923_1_IF_HZ;
+pub use pkt::{
+    legacy_timestamp_correction_us, parse_rx_buffer, time_on_air_us, FskTx, RxDump, RxModulation,
+    RxPacket, TxRequest, TxTrigger, RSSI_OFFSET_SX1250,
+};
+pub use plan::{
+    bw_code_to_hz, bw_hz_to_code, ChainKind, ChainMap, ChannelPlan, FskChan, LoraStdChan,
+    MultiSfChan, BW_125KHZ, BW_250KHZ, BW_500KHZ,
+};
 pub use timestamp::TimestampDump;
 
 pub struct Concentrator {
     bus: SpiBus,
+    /// Active RX plan (set by `start`), used to resolve RX packet frequencies.
+    plan: std::sync::Mutex<ChannelPlan>,
+    /// 27-bit µs counter wrap tracking (`timestamp_counter_t`).
+    ts: std::sync::Mutex<timestamp::TsWrap>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +47,8 @@ impl Concentrator {
     pub fn open(config: SpiConfig) -> Result<Self> {
         Ok(Self {
             bus: SpiBus::open(config)?,
+            plan: std::sync::Mutex::new(ChannelPlan::as923_1_default()),
+            ts: std::sync::Mutex::new(timestamp::TsWrap::default()),
         })
     }
 

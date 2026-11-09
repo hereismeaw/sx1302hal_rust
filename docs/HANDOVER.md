@@ -133,6 +133,17 @@ RX FIFO parser (`loragw_sx1302_rx.c`): sync `A5 C0`, head 9 + payload + tail 14,
 - **OTAA end-to-end (07:24–07:27 UTC):** `tools/tbeam-otaa-node` (RadioLib 7.8 LoRaWAN 1.0.3, keys in git-ignored `src/keys.h`) joined ChirpStack device `70b3d57ed0087e58` (app "DEV sx1302-hal-rs", profile "DEV sx1302-hal-rs T-Beam OTAA") through this gateway. JoinAccept 33 B on RX1 (+5 s), confirmed uplinks on 922.6–924.0 MHz all ACKed in RX1, ADR moved SF9→SF7, queued app downlink (fPort 10, `Hello Rust`) delivered. A downlink right after the 2^27 µs `tmst` wrap also landed.
 - Still open: `powe` → power LUT mapping (fixed index 22); RX `tmst` wraps at 2^27 µs (TX math is wrap-safe, but expand to 32-bit for NS-side stats); RX timestamp correction per SF (legacy end-of-packet ts).
 
+## Channel plan, JIT, FSK, 32-bit tmst, SF timestamp correction (2026-11-09, Claude)
+
+- **Channel plan** (`ChannelPlan`, `crates/sx1302-hal/src/plan.rs`, JSON in `configs/sx1302-daemon.json`, installed as `/etc/sx1302-daemon.json`): radio A 922.9 MHz (922.6/922.8/923.0/923.2), radio B 923.7 MHz (923.4/923.6/923.8/924.0) = ChirpStack `as923` plan; LoRa service chain 924.3 MHz SF7 BW250 (radio B); FSK 922.3 MHz 50 kb/s (radio A). Validation: inside 920–925 MHz and |IF|+BW/2 ≤ 800 kHz. `Concentrator::start(&plan)`; `start_as923_1()` = default plan (no service/FSK).
+- **Radio B fix:** with `single_input_mode` on radio B, RSSI was ~40 dB low (-83 vs -42 dBm, same node). Differential input on B fixes it; A identical either way. Default `single_input_mode: [true, false]`.
+- **32-bit tmst:** `TsWrap` expands the 27-bit µs counter (modular distance, handles packets finishing between the counter read and the FIFO read). TX math unchanged (`tmst·32 mod 2^32` = raw counter). Verified with ChirpStack downlinks at tmst > 2^27.
+- **RX timestamp correction:** Semtech `legacy_timestamp_correction` ported (SF7 12 B: -468 µs, grows with SF); FSK `680000/dr - 20`. TX start delay now per Semtech `sx1302_tx_set_start_delay` (48000 − 19 − filter − 64 ticks).
+- **JIT queue** (`apps/sx1302-daemon/src/jit.rs`): TX_ACK on enqueue, arm 100 ms before emission (arming takes ~3 ms), TOO_LATE < 20 ms, TOO_EARLY > 30 s, COLLISION_PACKET on overlapping air time.
+- **FSK:** RX parse (chain 9, `modu:"FSK"`, RSSI linearisation) and TX (`sx1302_send` FSK branch incl. AGC mailbox fdev).
+- **Hardware test** (`tools/tbeam-as923-node` cycles 8 cases, `tools/gwmp_echo_ns.py` answers +1 s / +2 s): all cases RX + TX on both radios. Downlink start (T-Beam, uplink end → downlink start, target 1000 ms): SF7 999.26, SF9 1002.28, SF10 1005.35, SF11 1011.83, SF12 1025.99, SF7BW250 998.87, FSK 1001.03. Fits `-1.6 ms + 0.84·Tsym`; the Tsym term is consistent with SX1276 RxDone latency on the node, gateway side follows Semtech's model. SF12 second downlink correctly refused (COLLISION_PACKET).
+- Caveats: FSK RSSI reads ~45 dB below LoRa at the same distance (Semtech formula, unverified against the C HAL); 2 of ~45 test downlinks CRC-failed at the T-Beam at -19 dBm (likely front-end overload at 1 m); `powe` still ignored (index 22).
+
 ## Next operator steps
 
 1. `gpio reset` then `start --region AS923-1` on the Pi; confirm AGC handshake (no timeout).

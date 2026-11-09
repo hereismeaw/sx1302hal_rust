@@ -19,7 +19,57 @@ pub struct TimestampDump {
     pub notes: Vec<String>,
 }
 
+/// Expands the 27-bit µs counter (32 MHz / 32) to the 32-bit GWMP `tmst` domain
+/// (`timestamp_counter_expand` / `timestamp_pkt_expand`). `tmst·32 mod 2^32` stays
+/// equal to the raw 32 MHz counter, so TX trigger math is unchanged.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct TsWrap {
+    last_us27: u32,
+    wraps: u32,
+    primed: bool,
+}
+
+const US27_MASK: u32 = (1 << 27) - 1;
+
+impl TsWrap {
+    /// Feed a fresh instantaneous counter reading (raw 32 MHz); returns expanded µs.
+    pub(crate) fn update(&mut self, inst_raw: u32) -> u32 {
+        let us27 = inst_raw / 32;
+        if self.primed && us27 < self.last_us27 {
+            self.wraps = self.wraps.wrapping_add(1);
+        }
+        self.primed = true;
+        self.last_us27 = us27;
+        (self.wraps << 27) | us27
+    }
+
+    /// Expand a packet timestamp latched near the last `update` (before it, or just
+    /// after it when a packet completes between the counter read and the FIFO read).
+    /// Uses the shortest modular distance in the 27-bit domain.
+    pub(crate) fn expand_pkt(&self, pkt_raw: u32) -> u32 {
+        let us27 = (pkt_raw / 32) & US27_MASK;
+        let last = (self.wraps << 27) | self.last_us27;
+        let d = us27.wrapping_sub(self.last_us27) & US27_MASK;
+        if d < (1 << 26) {
+            last.wrapping_add(d) // at/after the reference reading
+        } else {
+            last.wrapping_sub((1 << 27) - d) // before it (possibly before a wrap)
+        }
+    }
+}
+
 impl Concentrator {
+    /// Current concentrator time in the 32-bit `tmst` domain (µs). Must be called at
+    /// least every ~134 s (the daemon polls continuously).
+    pub fn now_us(&self) -> Result<u32> {
+        let raw = self.inst_raw_32mhz()?;
+        Ok(self.ts.lock().unwrap().update(raw))
+    }
+
+    pub(crate) fn expand_pkt_ts(&self, pkt_raw: u32) -> u32 {
+        self.ts.lock().unwrap().expand_pkt(pkt_raw)
+    }
+
     /// Latch end-of-packet (legacy) timestamps. Fine timestamp refused on SX1302.
     pub fn configure_timestamp(&self, fine: bool) -> Result<Vec<String>> {
         let mut notes = Vec::new();
@@ -92,5 +142,30 @@ impl Concentrator {
             fine_supported: fine_timestamp_supported(model),
             notes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TsWrap;
+
+    #[test]
+    fn expands_past_27_bits() {
+        let mut w = TsWrap::default();
+        let near_wrap = ((1u32 << 27) - 1_000) * 32;
+        assert_eq!(w.update(near_wrap), (1 << 27) - 1_000);
+        // counter wraps: raw 32 MHz goes past 2^32
+        let after = 500u32 * 32;
+        assert_eq!(w.update(after), (1 << 27) + 500);
+        // packet latched 2000 µs earlier (before the wrap)
+        assert_eq!(w.expand_pkt(near_wrap - 1_000 * 32), (1 << 27) - 2_000);
+        // packet latched after the wrap
+        assert_eq!(w.expand_pkt(200 * 32), (1 << 27) + 200);
+        // packet completed just after the counter read (race seen on hardware)
+        let mut w2 = TsWrap::default();
+        assert_eq!(w2.update(3_000_000 * 32), 3_000_000);
+        assert_eq!(w2.expand_pkt(3_000_400 * 32), 3_000_400);
+        // tmst·32 == raw counter mod 2^32 (TX trigger domain unchanged)
+        assert_eq!(((1u32 << 27) + 500).wrapping_mul(32), after);
     }
 }

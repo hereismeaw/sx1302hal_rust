@@ -349,6 +349,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "sensecap-board",
+ "serde",
  "serde_json",
  "sx1302-core",
  "sx1302-hal",

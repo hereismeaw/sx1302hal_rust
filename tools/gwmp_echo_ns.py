@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Minimal GWMP v2 "network server" for gateway downlink tests.
 
-ACKs PUSH_DATA / PULL_DATA like ChirpStack's gateway bridge and, for every CRC-OK
-uplink whose payload starts with b"TBEAM", answers with a Class A style RX1
-downlink: PULL_RESP txpk { imme:false, tmst: rx_tmst + DELAY_US, ipol:true }.
+ACKs PUSH_DATA / PULL_DATA like ChirpStack's gateway bridge. For every CRC-OK
+uplink from tools/tbeam-as923-node (payload b"TB" + case + seq) it answers on
+the same frequency / data rate:
+
+* LoRa: two downlinks, tmst + DELAY_US (RX1-like) and tmst + 2*DELAY_US, ipol=true.
+  At SF12 the second one overlaps the first and must be refused by the JIT queue.
+* FSK: one downlink at tmst + DELAY_US.
 
 Usage: python3 gwmp_echo_ns.py [port] [delay_us]
 """
@@ -19,7 +23,17 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind(("127.0.0.1", PORT))
 pull_addr = None
 dl_token = 0x1000
-print(f"echo NS on 127.0.0.1:{PORT}, RX1 delay {DELAY_US} us", flush=True)
+pending = {}
+print(f"echo NS on 127.0.0.1:{PORT}, delay {DELAY_US} us", flush=True)
+
+
+def send_txpk(txpk, label):
+    global dl_token
+    dl_token = (dl_token + 1) & 0xFFFF
+    pending[dl_token] = label
+    sock.sendto(bytes([2]) + dl_token.to_bytes(2, "big") + b"\x03"
+                + json.dumps({"txpk": txpk}).encode(), pull_addr)
+
 
 while True:
     data, addr = sock.recvfrom(65535)
@@ -31,32 +45,37 @@ while True:
         body = json.loads(data[12:])
         for pk in body.get("rxpk", []):
             payload = base64.b64decode(pk["data"])
-            if pk.get("stat") != 1 or not payload.startswith(b"TBEAM") or pull_addr is None:
+            if pk.get("stat") != 1 or not payload.startswith(b"TB") or pull_addr is None:
                 continue
-            seq = int.from_bytes(payload[6:10], "big")
-            dl = b"DL" + seq.to_bytes(4, "big")
-            txpk = {
-                "imme": False,
-                "tmst": (pk["tmst"] + DELAY_US) & 0xFFFFFFFF,
-                "freq": pk["freq"],
-                "rfch": 0,
-                "powe": 14,
-                "modu": "LORA",
-                "datr": pk["datr"],
-                "codr": "4/5",
-                "ipol": True,
-                "prea": 8,
-                "size": len(dl),
-                "data": base64.b64encode(dl).decode(),
-            }
-            dl_token = (dl_token + 1) & 0xFFFF
-            sock.sendto(bytes([2]) + dl_token.to_bytes(2, "big") + b"\x03"
-                        + json.dumps({"txpk": txpk}).encode(), pull_addr)
-            print(f"uplink seq={seq} tmst={pk['tmst']} -> PULL_RESP token={dl_token:#06x}", flush=True)
+            case = payload[2]
+            seq = int.from_bytes(payload[3:5], "big")
+            print(f"up case={case} seq={seq} {pk['modu']} {pk['datr']} {pk['freq']} MHz "
+                  f"chan={pk['chan']} rfch={pk['rfch']} rssi={pk['rssi']} tmst={pk['tmst']}", flush=True)
+            n_dl = 1 if pk["modu"] == "FSK" else 2
+            for k in range(1, n_dl + 1):
+                dl = b"DL" + bytes([case, k]) + seq.to_bytes(2, "big")
+                txpk = {
+                    "imme": False,
+                    "tmst": (pk["tmst"] + k * DELAY_US) & 0xFFFFFFFF,
+                    "freq": pk["freq"],
+                    "rfch": 0,
+                    "powe": 14,
+                    "modu": pk["modu"],
+                    "datr": pk["datr"],
+                    "size": len(dl),
+                    "data": base64.b64encode(dl).decode(),
+                }
+                if pk["modu"] == "LORA":
+                    txpk.update({"codr": "4/5", "ipol": True, "prea": 8})
+                else:
+                    txpk.update({"fdev": 25000, "prea": 5})
+                send_txpk(txpk, f"case={case} seq={seq} dl{k}")
         if "stat" in body:
             print(f"stat {body['stat']}", flush=True)
     elif ident == 0x02:  # PULL_DATA
         pull_addr = addr
         sock.sendto(bytes([2]) + token + b"\x04", addr)
     elif ident == 0x05:  # TX_ACK
-        print(f"TX_ACK token={int.from_bytes(token, 'big'):#06x} {data[12:].decode(errors='replace')}", flush=True)
+        t = int.from_bytes(token, "big")
+        err = json.loads(data[12:] or b"{}").get("txpk_ack", {}).get("error", "?")
+        print(f"  TX_ACK {pending.pop(t, hex(t))}: {err}", flush=True)
