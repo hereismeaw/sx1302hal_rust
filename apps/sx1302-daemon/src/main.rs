@@ -9,7 +9,7 @@ use sensecap_board::reset_sensecap_m1;
 use serde::Deserialize;
 use serde_json::json;
 use sx1302_core::Region;
-use sx1302_hal::{bw_hz_to_code, ChannelPlan, Concentrator, FskTx, TxRequest, TxTrigger};
+use sx1302_hal::{bw_hz_to_code, ChannelPlan, Concentrator, FskTx, TxGainLut, TxRequest, TxTrigger};
 use sx1302_transport::SpiConfig;
 use std::net::UdpSocket;
 use std::thread;
@@ -39,6 +39,9 @@ struct Config {
     stat_interval: Option<u64>,
     #[serde(default)]
     plan: Option<ChannelPlan>,
+    /// Semtech `tx_gain_lut` (rf_power / pa_gain / pwr_idx). Default = Semtech SX1250 table.
+    #[serde(default)]
+    tx_gain_lut: Option<TxGainLut>,
 }
 
 const PKT_PUSH_DATA: u8 = 0x00;
@@ -77,6 +80,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let server = args.server.or(cfg.server).unwrap_or_default();
     let stat_interval = args.stat_interval.or(cfg.stat_interval).unwrap_or(30);
     let plan = cfg.plan.unwrap_or_else(ChannelPlan::as923_1_default);
+    let lut = cfg.tx_gain_lut.unwrap_or_default();
     plan.validate(Region::As923_1)?;
 
     match reset_sensecap_m1() {
@@ -206,7 +210,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let resp_token = u16::from_be_bytes([buf[1], buf[2]]);
                         let json = std::str::from_utf8(&buf[4..n]).unwrap_or("");
                         eprintln!("PULL_RESP {json}");
-                        let err = match parse_txpk(json) {
+                        let err = match parse_txpk(json, &lut) {
                             Ok((req, start)) => {
                                 let now = c.now_us()?;
                                 match jit.enqueue(req, start, now) {
@@ -258,7 +262,7 @@ fn tx_ack(sock: &UdpSocket, token: u16, eui: u64, error: &str) -> std::io::Resul
 }
 
 /// GWMP `txpk` -> request + emission time (`None` = immediate). Errors are GWMP codes.
-fn parse_txpk(json: &str) -> Result<(TxRequest, Option<u32>), &'static str> {
+fn parse_txpk(json: &str, lut: &TxGainLut) -> Result<(TxRequest, Option<u32>), &'static str> {
     let v: serde_json::Value = serde_json::from_str(json).map_err(|_| "COLLISION_PACKET")?;
     let tx = v.get("txpk").ok_or("COLLISION_PACKET")?;
     let freq = tx.get("freq").and_then(|x| x.as_f64()).ok_or("TX_FREQ")?;
@@ -278,6 +282,9 @@ fn parse_txpk(json: &str) -> Result<(TxRequest, Option<u32>), &'static str> {
     let modu = tx.get("modu").and_then(|x| x.as_str()).unwrap_or("LORA");
     let mut req = TxRequest::as923_1_sf7(payload).map_err(|_| "TX_FREQ")?;
     req.freq_hz = freq_hz;
+    // GWMP `powe` (dBm, conducted) -> nearest LUT entry not above it.
+    let powe = tx.get("powe").and_then(|x| x.as_i64()).unwrap_or(14).clamp(-128, 127) as i8;
+    req.set_power(lut, powe);
     req.trigger = match start {
         None => TxTrigger::Immediate,
         Some(t) => TxTrigger::Timestamped(t),
@@ -412,20 +419,28 @@ mod tests {
 
     #[test]
     fn txpk_lora_and_fsk() {
+        let lut = TxGainLut::default();
         let (r, t) = parse_txpk(
-            r#"{"txpk":{"imme":false,"tmst":5000000,"freq":923.2,"modu":"LORA","datr":"SF10BW125","codr":"4/5","ipol":true,"data":"AQID"}}"#,
+            r#"{"txpk":{"imme":false,"tmst":5000000,"freq":923.2,"powe":16,"modu":"LORA","datr":"SF10BW125","codr":"4/5","ipol":true,"data":"AQID"}}"#,
+            &lut,
         )
         .unwrap();
         assert_eq!((r.sf, r.invert_pol, t), (10, true, Some(5_000_000)));
+        assert_eq!((r.pa_gain, r.power_idx), (0, 20)); // 16 dBm entry
         let (r, t) = parse_txpk(
-            r#"{"txpk":{"imme":true,"freq":922.3,"modu":"FSK","datr":50000,"fdev":25000,"data":"AQID"}}"#,
+            r#"{"txpk":{"imme":true,"freq":922.3,"powe":30,"modu":"FSK","datr":50000,"fdev":25000,"data":"AQID"}}"#,
+            &lut,
         )
         .unwrap();
         assert_eq!(t, None);
         assert_eq!(r.fsk.unwrap().datarate, 50_000);
+        assert_eq!((r.pa_gain, r.power_idx), (1, 14)); // capped at 27 dBm
         assert_eq!(
-            parse_txpk(r#"{"txpk":{"tmst":1,"freq":868.1,"modu":"LORA","datr":"SF7BW125","data":"AQ=="}}"#)
-                .unwrap_err(),
+            parse_txpk(
+                r#"{"txpk":{"tmst":1,"freq":868.1,"modu":"LORA","datr":"SF7BW125","data":"AQ=="}}"#,
+                &lut
+            )
+            .unwrap_err(),
             "TX_FREQ"
         );
     }

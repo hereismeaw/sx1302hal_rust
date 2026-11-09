@@ -96,6 +96,63 @@ fn default_fsk_sync_size() -> u8 {
     3
 }
 
+/// One `tx_gain_lut` entry (`struct lgw_tx_gain_s`, SX1250 fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxGain {
+    /// Conducted RF power at the connector (dBm) this entry was calibrated for.
+    pub rf_power: i8,
+    /// External PA: 0 = off, >0 = on (only 1 bit drives the PA on SX1250 boards).
+    pub pa_gain: u8,
+    /// SX1250 power index (0..=31).
+    pub pwr_idx: u8,
+}
+
+/// TX gain LUT. Default = Semtech `global_conf.json.sx1250.*` (WM1302 / Corecell).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxGainLut(pub Vec<TxGain>);
+
+impl Default for TxGainLut {
+    fn default() -> Self {
+        const T: [(i8, u8, u8); 16] = [
+            (12, 0, 15),
+            (13, 0, 16),
+            (14, 0, 17),
+            (15, 0, 19),
+            (16, 0, 20),
+            (17, 0, 22),
+            (18, 1, 1),
+            (19, 1, 2),
+            (20, 1, 3),
+            (21, 1, 4),
+            (22, 1, 5),
+            (23, 1, 6),
+            (24, 1, 7),
+            (25, 1, 9),
+            (26, 1, 11),
+            (27, 1, 14),
+        ];
+        Self(
+            T.iter()
+                .map(|&(rf_power, pa_gain, pwr_idx)| TxGain { rf_power, pa_gain, pwr_idx })
+                .collect(),
+        )
+    }
+}
+
+impl TxGainLut {
+    /// `sx1302_send`: highest entry with `rf_power <= requested`, else entry 0.
+    pub fn select(&self, rf_power_dbm: i8) -> TxGain {
+        let mut lut = self.0.clone();
+        lut.sort_by_key(|g| g.rf_power);
+        lut.iter()
+            .rev()
+            .find(|g| g.rf_power <= rf_power_dbm)
+            .or(lut.first())
+            .copied()
+            .unwrap_or(TxGain { rf_power: 14, pa_gain: 0, pwr_idx: 17 })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxRequest {
     pub region: Region,
@@ -104,7 +161,11 @@ pub struct TxRequest {
     pub bw: u8,
     pub cr: u8,
     pub payload: Vec<u8>,
+    /// SX1250 power index (from [`TxGainLut::select`]).
     pub power_idx: u8,
+    /// External PA on (`pa_gain > 0`).
+    #[serde(default)]
+    pub pa_gain: u8,
     /// LoRaWAN downlink = true (GWMP `ipol`).
     #[serde(default)]
     pub invert_pol: bool,
@@ -144,12 +205,22 @@ impl TxRequest {
             bw: BW_125KHZ,
             cr: 1,
             payload,
-            power_idx: 22,
+            // 14 dBm from the default LUT (PA off)
+            power_idx: 17,
+            pa_gain: 0,
             invert_pol: false,
             preamble: 8,
             trigger: TxTrigger::Immediate,
             fsk: None,
         })
+    }
+
+    /// Apply a LUT entry for `rf_power_dbm`; returns the entry used.
+    pub fn set_power(&mut self, lut: &TxGainLut, rf_power_dbm: i8) -> TxGain {
+        let g = lut.select(rf_power_dbm);
+        self.power_idx = g.pwr_idx;
+        self.pa_gain = g.pa_gain;
+        g
     }
 
     /// Air time (µs) of this request.
@@ -577,7 +648,11 @@ impl Concentrator {
         port.write_u8(TX_A + 37, ((freq_reg >> 16) & 0xFF) as u8)?;
         port.write_u8(TX_A + 38, ((freq_reg >> 8) & 0xFF) as u8)?;
         port.write_u8(TX_A + 39, (freq_reg & 0xFF) as u8)?;
-        let power = (1u8 << 6) | (req.power_idx & 0x3F);
+        if req.power_idx > 31 {
+            return Err(HalError::Other(format!("pwr_idx {} > 31", req.power_idx)));
+        }
+        // SX1250: power = (pa_en << 6) | pwr_idx
+        let power = (u8::from(req.pa_gain > 0) << 6) | req.power_idx;
         port.write_u8(TX_A + 13, power)?; // AGC_TX_PWR
 
         let tx_start_delay: u32 = if let Some(f) = &req.fsk {
@@ -626,11 +701,13 @@ impl Concentrator {
                 port.rmw(TX_A, 1, 1, 0)?;
                 port.rmw(TX_A, 1, 1, 1)?; // TX_TRIG_DELAYED
                 Ok(format!(
-                    "TX_TOP_A scheduled tmst={count_us} (+{} ms) {} Hz {what} {} bytes ipol={}",
+                    "TX_TOP_A scheduled tmst={count_us} (+{} ms) {} Hz {what} {} bytes ipol={} pa={} idx={}",
                     ahead / 32_000,
                     req.freq_hz,
                     req.payload.len(),
-                    req.invert_pol
+                    req.invert_pol,
+                    u8::from(req.pa_gain > 0),
+                    req.power_idx
                 ))
             }
         }
@@ -809,6 +886,16 @@ mod tests {
             assert!(c < last, "SF{sf} {c}");
             last = c;
         }
+    }
+
+    #[test]
+    fn lut_selection_matches_semtech() {
+        let lut = TxGainLut::default();
+        assert_eq!(lut.select(14), TxGain { rf_power: 14, pa_gain: 0, pwr_idx: 17 });
+        assert_eq!(lut.select(16), TxGain { rf_power: 16, pa_gain: 0, pwr_idx: 20 });
+        assert_eq!(lut.select(30).rf_power, 27); // capped at the top entry
+        assert_eq!(lut.select(5).rf_power, 12); // below table -> entry 0
+        assert_eq!(lut.select(18).pa_gain, 1);
     }
 
     #[test]

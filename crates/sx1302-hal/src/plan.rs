@@ -59,11 +59,11 @@ pub struct FskChan {
     pub sync_word_size: u8,
 }
 
+/// Semtech reference (`global_conf.json.sx1250.*`) leaves both radios differential.
 /// Measured on WM1302 / SenseCAP M1 (2026-11-09): radio B in single-input mode
-/// reads ~40 dB low (-83 vs -42 dBm, same node); differential fixes it. Radio A
-/// is identical in both modes.
+/// reads ~40 dB low (-83 vs -42 dBm, same node); radio A is identical either way.
 fn default_single_input() -> [bool; 2] {
-    [true, false]
+    [false, false]
 }
 
 fn default_sync_word() -> u64 {

@@ -17,7 +17,7 @@ mod start;
 mod timestamp;
 pub use pkt::{
     legacy_timestamp_correction_us, parse_rx_buffer, time_on_air_us, FskTx, RxDump, RxModulation,
-    RxPacket, TxRequest, TxTrigger, RSSI_OFFSET_SX1250,
+    RxPacket, TxGain, TxGainLut, TxRequest, TxTrigger, RSSI_OFFSET_SX1250,
 };
 pub use plan::{
     bw_code_to_hz, bw_hz_to_code, ChainKind, ChainMap, ChannelPlan, FskChan, LoraStdChan,
