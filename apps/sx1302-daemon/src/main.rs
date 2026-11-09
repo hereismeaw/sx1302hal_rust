@@ -117,6 +117,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_health = Instant::now();
     let mut health_ts = Some(c.health_check(None)?);
     let mut last_server_ack = Instant::now();
+    let mut server_lost = false;
+    // Test hook: answer TOO_LATE to every other PULL_RESP so the network server
+    // falls back to RX2 (exercises RX2 / JoinAccept-RX2 end to end). Never set in production.
+    let reject_alternate = std::env::var_os("SX1302_TEST_REJECT_ALTERNATE_DL").is_some();
+    let mut dl_seen: u32 = 0;
+    if reject_alternate {
+        eprintln!("TEST MODE: rejecting every other downlink with TOO_LATE");
+    }
     // Board temperature (STTS751 @ I2C-1 0x39) for RSSI temperature compensation.
     let temp_sensor = match sensecap_board::temp::Stts751::open() {
         Ok(s) => Some(s),
@@ -177,7 +185,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let body = json!({ "rxpk": rxpk });
                 println!("{body}");
                 if let Some(s) = &sock {
-                    push(s, token, eui, &body.to_string())?;
+                    soft(push(s, token, eui, &body.to_string()), "PUSH_DATA rxpk");
                     st.rxfw += rxpk.len() as u32;
                     st.push_sent += 1;
                     token = token.wrapping_add(1);
@@ -219,7 +227,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
                 eprintln!("{stat}");
-                push(s, token, eui, &stat.to_string())?;
+                soft(push(s, token, eui, &stat.to_string()), "PUSH_DATA stat");
                 st = Stats {
                     push_sent: st.push_sent + 1,
                     push_ack: st.push_ack,
@@ -229,9 +237,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 last_stat = Instant::now();
             }
             if last_pull.elapsed() > Duration::from_secs(5) {
-                s.send(&gwmp_hdr(PKT_PULL_DATA, token, eui))?;
+                soft(s.send(&gwmp_hdr(PKT_PULL_DATA, token, eui)).map(|_| ()), "PULL_DATA");
                 token = token.wrapping_add(1);
                 last_pull = Instant::now();
+            }
+            if !server_lost && last_server_ack.elapsed() > Duration::from_secs(30) {
+                eprintln!("server {server}: no ACK for 30 s (link down?), still receiving RF");
+                server_lost = true;
             }
             let mut buf = [0u8; 65536];
             while let Ok(n) = s.recv(&mut buf) {
@@ -239,6 +251,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 if matches!(buf[3], PKT_PUSH_ACK | PKT_PULL_ACK | PKT_PULL_RESP) {
+                    if server_lost {
+                        eprintln!(
+                            "server {server} back after {} s",
+                            last_server_ack.elapsed().as_secs()
+                        );
+                        server_lost = false;
+                    }
                     last_server_ack = Instant::now();
                 }
                 match buf[3] {
@@ -254,7 +273,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let resp_token = u16::from_be_bytes([buf[1], buf[2]]);
                         let json = std::str::from_utf8(&buf[4..n]).unwrap_or("");
                         eprintln!("PULL_RESP {json}");
+                        dl_seen += 1;
                         let err = match parse_txpk(json, &lut) {
+                            Ok(_) if reject_alternate && dl_seen % 2 == 1 => {
+                                eprintln!("TEST MODE: rejecting this downlink (TOO_LATE)");
+                                "TOO_LATE"
+                            }
                             Ok((req, start)) => {
                                 let now = c.now_us()?;
                                 match jit.enqueue(req, start, now) {
@@ -278,13 +302,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 e
                             }
                         };
-                        tx_ack(s, resp_token, eui, err)?;
+                        soft(tx_ack(s, resp_token, eui, err), "TX_ACK");
                     }
                     _ => {}
                 }
             }
         }
         thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Network errors (ECONNREFUSED from a dead server, ENETUNREACH while the link is
+/// down, ...) must not kill the concentrator: log at most every 30 s and carry on.
+fn soft(r: std::io::Result<()>, what: &str) {
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    if let Err(e) = r {
+        let mut last = LAST.lock().unwrap();
+        if last.is_none_or(|t| t.elapsed() > Duration::from_secs(30)) {
+            eprintln!("{what}: {e} (continuing; packets dropped until the server is reachable)");
+            *last = Some(Instant::now());
+        }
     }
 }
 

@@ -148,6 +148,13 @@ RX FIFO parser (`loragw_sx1302_rx.c`): sync `A5 C0`, head 9 + payload + tail 14,
 - **Watchdog**: unit is `Type=notify`, `WatchdogSec=30`. The daemon sends READY=1, then WATCHDOG=1 every 15 s only after a health check (SPI `COMMON_VERSION`=0x10 and 32 MHz counter advancing); a failed check exits → restart with GPIO reset. Verified: SIGSTOP → `Watchdog timeout` → restart → PULL_ACK. `systemctl status` shows STATUS (server link, JIT queue, board temperature).
 - **RSSI temperature compensation**: STTS751 found at I2C-1 0x39 (man 0x53, prod 0x00; read-only use). `rssi_offset` / `rssi_tcomp` per radio in the plan (Semtech defaults), applied like `loragw_hal.c` (+1.77 dB at 39 °C).
 
+## Robustness tests (2026-11-09)
+
+- **Server outage:** UDP send errors (ECONNREFUSED / ENETUNREACH) are logged (≤ 1 per 30 s) instead of exiting. Test: echo NS up 20 s → down 50 s → up: daemon stayed up, logged `no ACK for 30 s`, then `back after 55 s`, kept receiving RF throughout.
+- **RX2 via ChirpStack:** test hook `SX1302_TEST_REJECT_ALTERNATE_DL=1` (env, off by default, never in the unit) answers TOO_LATE to every other PULL_RESP so ChirpStack falls back to RX2. Result: confirmed uplinks ACKed in RX2 (923.2 MHz SF10, +2 s) 6/6, and **JoinAccept in RX2** (+6 s, 33 B SF10) → join OK.
+- **Reboot:** service back automatically with the watchdog build, NRestarts 0, RX1 downlinks within a minute.
+- Not done (weather / equipment): field range, conducted TX power measurement, multi-node load. No Tailscale on the Pi, so the Tailscale path to ChirpStack is untested.
+
 ## WM1302 HAT LEDs (2026-11-09)
 
 Seeed wiki lists Power (green), Config (red), TX (green), RX (blue) but no Pi GPIO for them — they hang off **SX1302 GPIOs**, configured like Semtech `sx1302_config_gpio`: GPIO0 = CONFIG_DONE (register, set at end of `start`), GPIO2 = TX ON, GPIO4 = RX toggle (hardware status), GPIO7 = AGC/LBT input, DIR_L = 0x7F. `Concentrator::set_config_led(bool)` drives Config. Visual confirmation on the unit pending (SenseCAP M1 enclosure may hide the HAT LEDs). The M1 front-panel LED, if separate, is still unmapped.
