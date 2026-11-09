@@ -86,6 +86,30 @@ void loop() {
     pkt[10] = 0xA5;
     pkt[11] = 0x23;
     int16_t st = radio.transmit(pkt, sizeof pkt);
+    uint32_t t_tx_done = micros();
     Serial.printf("tx seq=%lu st=%d\n", (unsigned long)seq, (int)st);
     seq++;
+
+    // Class A style RX1 check: gateway downlinks use inverted IQ (LoRaWAN ipol=true).
+    // Report time from uplink end to downlink end so the gateway scheduler can be measured.
+    radio.invertIQ(true);
+    uint8_t dl[64];
+    int16_t dst = radio.receive(dl, sizeof dl, 2500);
+    uint32_t t_rx_done = micros();
+    if (dst == RADIOLIB_ERR_NONE) {
+        size_t n = radio.getPacketLength();
+        float toa_ms = radio.getTimeOnAir(n) / 1000.0f;
+        float dt_ms = (t_rx_done - t_tx_done) / 1000.0f;
+        Serial.printf("dl n=%u rssi=%.1f snr=%.1f dt=%.2fms toa=%.2fms start=%.2fms data=",
+                      (unsigned)n, radio.getRSSI(), radio.getSNR(), dt_ms, toa_ms, dt_ms - toa_ms);
+        for (size_t i = 0; i < n && i < sizeof dl; i++) {
+            Serial.printf("%02x", dl[i]);
+        }
+        Serial.println();
+    } else if (dst == RADIOLIB_ERR_RX_TIMEOUT) {
+        Serial.println("dl none (inverted IQ, 2.5s)");
+    } else {
+        Serial.printf("dl err %d\n", (int)dst);
+    }
+    radio.invertIQ(false);
 }

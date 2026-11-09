@@ -123,6 +123,16 @@ RX FIFO parser (`loragw_sx1302_rx.c`): sync `A5 C0`, head 9 + payload + tail 14,
 - ATECC 0x60 no response
 - SX126 GET_STATUS `0x50` (CE0 still asserted — untrusted)
 
+## GWMP / ChirpStack + timed downlink (2026-11-09, Claude)
+
+- `send_lora` supports `TxTrigger::Timestamped(tmst)` (TX_TRIG_DELAYED, timer = tmst·32 − TX_START_DELAY 0xBB80), `invert_pol` (CHIRP_INVERT), preamble, SF-dependent CHIRP_LOWPASS / FINE_SYNCH / PPM_OFFSET (SF11/12). TOO_LATE (<1 ms) / TOO_EARLY (>10 s, JoinAccept needs 5–6 s) refused; TX FSM busy → COLLISION_PACKET.
+- Daemon: TX_ACK echoes PULL_RESP token with `txpk_ack.error`; honours `imme`/`tmst`/`ipol`/`prea`; `stat.time` = `YYYY-MM-DD hh:mm:ss GMT`, real rxnb/rxok/rxfw/dwnb/txnb/ackr; forwards CRC-OK only, de-duplicates multi-SF vs LoRa-service copies; logs PULL_ACK.
+- `tools/gwmp_echo_ns.py`: fake NS on the Pi answering each `TBEAM` uplink with RX1 (`tmst+1 s`, `ipol=true`). T-Beam firmware now listens with inverted IQ after each TX and prints `start=` (uplink end → downlink start).
+- **Measured:** 4/4 downlinks `start=999.72 ms` (target 1000 ms), CRC OK at T-Beam, TX_ACK `NONE`.
+- **ChirpStack 192.168.0.101:1700:** PULL_ACK + PUSH_ACK 100 %; gateway `0016c001f106659f` registered in tenant *Southern IoT* as "Meaw - sx1302-hal-rs dev (Pi5 SenseCAP M1)"; `lastSeenAt` updates from our `stat`.
+- **OTAA end-to-end (07:24–07:27 UTC):** `tools/tbeam-otaa-node` (RadioLib 7.8 LoRaWAN 1.0.3, keys in git-ignored `src/keys.h`) joined ChirpStack device `70b3d57ed0087e58` (app "DEV sx1302-hal-rs", profile "DEV sx1302-hal-rs T-Beam OTAA") through this gateway. JoinAccept 33 B on RX1 (+5 s), confirmed uplinks on 922.6–924.0 MHz all ACKed in RX1, ADR moved SF9→SF7, queued app downlink (fPort 10, `Hello Rust`) delivered. A downlink right after the 2^27 µs `tmst` wrap also landed.
+- Still open: `powe` → power LUT mapping (fixed index 22); RX `tmst` wraps at 2^27 µs (TX math is wrap-safe, but expand to 32-bit for NS-side stats); RX timestamp correction per SF (legacy end-of-packet ts).
+
 ## Next operator steps
 
 1. `gpio reset` then `start --region AS923-1` on the Pi; confirm AGC handshake (no timeout).

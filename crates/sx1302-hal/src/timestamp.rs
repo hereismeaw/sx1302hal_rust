@@ -43,6 +43,18 @@ impl Concentrator {
         Ok(notes)
     }
 
+    /// Free-running 32 MHz counter (`TIMESTAMP_INST`), same domain as RX packet timestamps.
+    pub fn inst_raw_32mhz(&self) -> Result<u32> {
+        let port = self.bus.sx1302();
+        let mut a = [0u8; 4];
+        let mut b = [0u8; 4];
+        port.read_burst(TS_PPS + 4, &mut a)?;
+        port.read_burst(TS_PPS + 4, &mut b)?;
+        let (a, b) = (u32::from_be_bytes(a), u32::from_be_bytes(b));
+        // reread guards against a carry between byte reads
+        Ok(if b.wrapping_sub(a) < 32 * 10_000 { b } else { a })
+    }
+
     pub fn read_timestamp(&self) -> Result<TimestampDump> {
         let port = self.bus.sx1302();
         let mut a = [0u8; 8];

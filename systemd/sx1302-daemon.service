@@ -1,12 +1,18 @@
 [Unit]
-Description=Native SX1302 concentrator daemon (not enabled until RX/TX HAL complete)
-After=network.target
+Description=Native Rust SX1302 GWMP forwarder (AS923-1) -> ChirpStack
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
-ExecStart=/usr/local/bin/sx1302-daemon
-Restart=no
+# GPIO reset (gpiochip0 / pinctrl) + /dev/spidev0.0 need root on this image.
+User=root
+EnvironmentFile=-/etc/default/sx1302-daemon
+ExecStart=/usr/local/bin/sx1302-daemon --server ${SX1302_SERVER}
+Restart=always
+RestartSec=5
+StandardOutput=null
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

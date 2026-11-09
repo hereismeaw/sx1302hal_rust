@@ -14,7 +14,7 @@ use sx1302_transport::{ConcentratorPort, SpiBus, SpiConfig};
 mod pkt;
 mod start;
 mod timestamp;
-pub use pkt::{parse_rx_buffer, RxDump, RxPacket, TxRequest, BW_125KHZ, RSSI_OFFSET_SX1250};
+pub use pkt::{parse_rx_buffer, RxDump, RxPacket, TxRequest, TxTrigger, BW_125KHZ, RSSI_OFFSET_SX1250};
 pub use start::AS923_1_IF_HZ;
 pub use timestamp::TimestampDump;
 

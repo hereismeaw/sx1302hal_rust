@@ -68,7 +68,29 @@ pub struct TxRequest {
     pub cr: u8,
     pub payload: Vec<u8>,
     pub power_idx: u8,
+    /// LoRaWAN downlink = true (GWMP `ipol`).
+    #[serde(default)]
+    pub invert_pol: bool,
+    #[serde(default = "default_preamble")]
+    pub preamble: u16,
+    #[serde(default)]
+    pub trigger: TxTrigger,
 }
+
+fn default_preamble() -> u16 {
+    8
+}
+
+/// `lgw_pkt_tx_s.tx_mode`: IMMEDIATE or TIMESTAMPED (1 MHz counter, GWMP `tmst`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TxTrigger {
+    #[default]
+    Immediate,
+    Timestamped(u32),
+}
+
+/// `TX_START_DELAY` register value (32 MHz ticks, Semtech default 1500 µs).
+const TX_START_DELAY_TICKS: u32 = 0xBB80;
 
 impl TxRequest {
     pub fn as923_1_sf7(payload: Vec<u8>) -> Result<Self> {
@@ -85,6 +107,9 @@ impl TxRequest {
             cr: 1,
             payload,
             power_idx: 22,
+            invert_pol: false,
+            preamble: 8,
+            trigger: TxTrigger::Immediate,
         })
     }
 }
@@ -220,7 +245,7 @@ impl RxPacket {
             "codr": cr,
             "rssi": self.rssi_chan as i32,
             "rssis": self.rssi_sig as i32,
-            "lsnr": (self.snr * 10.0).round() / 10.0,
+            "lsnr": (f64::from(self.snr) * 10.0).round() / 10.0,
             "foff": self.freq_offset,
             "size": self.size,
             "data": b64(&self.payload),
@@ -287,7 +312,14 @@ impl Concentrator {
         if req.payload.is_empty() || req.payload.len() > 255 {
             return Err(HalError::Other("payload 1..=255".into()));
         }
+        if !(5..=12).contains(&req.sf) {
+            return Err(HalError::Other(format!("SF{} unsupported", req.sf)));
+        }
         let port = self.bus.sx1302();
+        let fsm0 = port.read_u8(TX_A + 17)?;
+        if fsm0 != 0x80 && fsm0 != 0x00 {
+            return Err(HalError::Other(format!("TX busy fsm={fsm0:#04x}")));
+        }
         let freq_reg = sx1302_freq_to_reg(req.freq_hz);
         port.write_u8(TX_A + 37, ((freq_reg >> 16) & 0xFF) as u8)?;
         port.write_u8(TX_A + 38, ((freq_reg >> 8) & 0xFF) as u8)?;
@@ -306,16 +338,24 @@ impl Concentrator {
         port.rmw(TX_A + 96, 0, 4, req.sf)?;
         port.rmw(TX_A + 97, 0, 3, req.cr)?;
         port.write_u8(TX_A + 99, req.payload.len() as u8)?;
-        port.write_u8(TX_A + 102, 8)?;
-        port.write_u8(TX_A + 103, 0)?;
+        let preamble = req.preamble.max(6);
+        port.write_u8(TX_A + 102, (preamble & 0xFF) as u8)?;
+        port.write_u8(TX_A + 103, (preamble >> 8) as u8)?;
         port.rmw(TX_A + 98, 6, 1, 1)?; // MODEM_EN
         port.rmw(TX_A + 98, 4, 2, 2)?; // CADRXTX TX
         port.rmw(TX_A + 98, 0, 1, 1)?; // CRC_EN
         port.rmw(TX_A + 101, 7, 1, 1)?; // MODEM_START
         port.rmw(TX_A + 105, 0, 1, 0)?; // not continuous
-        port.rmw(TX_A + 105, 1, 1, 0)?; // chirp invert off
-        port.rmw(TX_A + 105, 4, 3, 6)?; // CHIRP_LOWPASS SF<10
-        port.rmw(TX_A + 98, 7, 1, 0)?; // FINE_SYNCH off SF7
+        port.rmw(TX_A + 105, 1, 1, u8::from(req.invert_pol))?; // CHIRP_INVERT (ipol)
+        let lowpass = if req.sf < 10 { 6 } else { 7 };
+        port.rmw(TX_A + 105, 4, 3, lowpass)?; // CHIRP_LOWPASS
+        let fine = u8::from(req.sf == 5 || req.sf == 6);
+        port.rmw(TX_A + 98, 7, 1, fine)?; // FINE_SYNCH_EN
+        // SET_PPM_ON: SF11/12 @ BW125 (low data-rate optimize)
+        let ppm = u8::from(req.bw == BW_125KHZ && req.sf >= 11);
+        port.rmw(TX_A + 97, 6, 2, ppm)?; // PPM_OFFSET_HDR_CTRL
+        port.rmw(TX_A + 97, 4, 2, ppm)?; // PPM_OFFSET
+        port.rmw(TX_A + 105, 3, 1, ppm)?; // PPM_OFFSET_SIG
         port.write_u8(TX_A + 9, 0)?; // LoRa modulation
         // Semtech sx1302_tx_configure + LoRa TX_IF_SRC=1
         port.rmw(TX_A + 32, 0, 2, 1)?; // TX_IF_SRC LoRa
@@ -333,6 +373,36 @@ impl Concentrator {
         // AGC owns radio SPI and PA/LNA LUT (HOST_RADIO_CTRL=0, FORCE_HOST_FE=0)
         port.rmw(0x5601, 3, 1, 0)?;
         port.rmw(0x5780, 3, 1, 0)?;
+        if let TxTrigger::Timestamped(count_us) = req.trigger {
+            // loragw_sx1302.c: timer = count_us*32 - tx_start_delay (32 MHz domain, wraps).
+            let target = count_us.wrapping_mul(32).wrapping_sub(TX_START_DELAY_TICKS);
+            let now = self.inst_raw_32mhz()?;
+            let ahead = target.wrapping_sub(now) as i32;
+            if ahead < 32 * 1_000 {
+                return Err(HalError::Other(format!(
+                    "TOO_LATE: {} µs before trigger",
+                    ahead / 32
+                )));
+            }
+            // JoinAccept RX1/RX2 = 5/6 s; the 32 MHz timer covers ~134 s.
+            if ahead > 32 * 10_000_000 {
+                return Err(HalError::Other(format!("TOO_EARLY: {} µs ahead", ahead / 32)));
+            }
+            port.write_u8(TX_A + 1, (target >> 24) as u8)?;
+            port.write_u8(TX_A + 2, (target >> 16) as u8)?;
+            port.write_u8(TX_A + 3, (target >> 8) as u8)?;
+            port.write_u8(TX_A + 4, target as u8)?;
+            port.rmw(TX_A + 0, 1, 1, 0)?;
+            port.rmw(TX_A + 0, 1, 1, 1)?; // TX_TRIG_DELAYED
+            return Ok(format!(
+                "TX_TOP_A scheduled tmst={count_us} (+{} ms) {} Hz SF{} {} bytes ipol={}",
+                ahead / 32_000,
+                req.freq_hz,
+                req.sf,
+                req.payload.len(),
+                req.invert_pol
+            ));
+        }
         port.rmw(TX_A + 0, 0, 1, 0)?;
         port.rmw(TX_A + 0, 0, 1, 1)?;
         std::thread::sleep(std::time::Duration::from_millis(20));
