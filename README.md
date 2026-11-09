@@ -8,6 +8,25 @@ Pinned to Semtech `sx1302_hal` **v2.1.0**
 
 Lab hardware: Raspberry Pi 5 + original SenseCAP M1 (WM1302 SPI), region **AS923-1** (920–925 MHz).
 
+## Status — not fully tested
+
+This is an **early, hardware-lab HAL**. It is **not** a drop-in replacement for Semtech `libloragw` on every board or region.
+
+**Exercised on one SenseCAP M1 + Pi 5 + T-Beam (AS923-1):** SPI detect, GPIO reset, SX1250 clock, OTP EUI, AGC/ARB load (fw 10 / 2), 8×125 kHz RX, live OTA RX/TX with T-Beam, legacy PPS counters, LoRa service + FSK config, SX126 LBT RSSI sample, LED GPIO22, pairing button GPIO27.
+
+**Not finished / not soaked:**
+- ChirpStack (or any LNS) join / downlink loop in production
+- LBT gating of TX (`txpk`)
+- WM1302 TX gain LUT and full image-cal table
+- Fine timestamp (this silicon is SX1302; SX1303-only)
+- GPS 1PPS (counter stays 0 on this carrier)
+- EU868 / US915 full channelizer `start`
+- Spectral scan, Class B beacon, timestamped TX
+- ATECC608 (I2C `0x60` did not respond; writes remain blocked)
+- Multi-HAT GPIO maps (button/LED differ by carrier)
+
+Treat `main` as **alpha**. Do not ship RF without your own air and regulatory checks.
+
 ## Why this is better than the C HAL
 
 | Topic | Semtech `libloragw` | This crate |
@@ -75,6 +94,13 @@ Regenerate the table after bumping the Semtech pin:
 ```bash
 python tools/gen_loregs.py
 ```
+
+## Contributors
+
+GitHub counts commits whose **author email is a verified address on the GitHub account**.
+This repo is authored as **[@hereismeaw](https://github.com/hereismeaw)** (`Kittiwut Khongkaeo`).
+
+See [CONTRIBUTORS.md](CONTRIBUTORS.md).
 
 ## License
 
