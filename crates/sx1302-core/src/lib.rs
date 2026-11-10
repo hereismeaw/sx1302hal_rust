@@ -72,6 +72,47 @@ pub enum Region {
     /// LoRaWAN AS923-1, RF limited to 920–925 MHz on this gateway.
     #[serde(rename = "AS923-1")]
     As923_1,
+    /// LoRaWAN 2.4 GHz (Semtech ISM2400). SX1280, not the SX1250 on this HAL.
+    #[serde(rename = "ISM2400")]
+    Ism2400,
+    /// IotaComm FCC Part 90 licensed block, 809.0–817.0 MHz (announced 2026-01-29).
+    /// No LoRa Alliance channel raster. SX1250 image cal has no row here
+    /// (Semtech's nearest row is 779–787 MHz).
+    #[serde(rename = "FCC-800")]
+    Fcc800,
+}
+
+/// ISM2400 default uplink channels (MHz): 2403, 2425, 2479. BW 812 kHz, DR0–DR7.
+pub const ISM2400_CHANNELS_HZ: [u32; 3] = [2_403_000_000, 2_425_000_000, 2_479_000_000];
+/// RX2 default: 2423 MHz, DR0.
+pub const ISM2400_RX2_HZ: u32 = 2_423_000_000;
+
+/// Part 90 12.5 kHz channel centers inside the announced 809.0–817.0 MHz block.
+/// Downlink is uplink + 45 MHz, which lands on 854.0125–861.9875 MHz — the FSK
+/// range in the TEKTELIC IotaComm gateway FCC exhibit. Not a LoRa raster.
+pub const FCC800_CH_STEP_HZ: u32 = 12_500;
+pub const FCC800_UPLINK_FIRST_HZ: u32 = 809_012_500;
+pub const FCC800_UPLINK_COUNT: u16 = 639;
+pub const FCC800_DUPLEX_HZ: u32 = 45_000_000;
+
+pub fn fcc800_uplink_hz(index: u16) -> Option<u32> {
+    if index >= FCC800_UPLINK_COUNT {
+        None
+    } else {
+        Some(FCC800_UPLINK_FIRST_HZ + u32::from(index) * FCC800_CH_STEP_HZ)
+    }
+}
+
+pub fn fcc800_downlink_hz(index: u16) -> Option<u32> {
+    fcc800_uplink_hz(index).map(|hz| hz + FCC800_DUPLEX_HZ)
+}
+
+/// DR0 = SF12 … DR7 = SF5, all at 812 kHz, coding rate 4/8 long interleaver.
+pub fn ism2400_sf(dr: u8) -> Option<u8> {
+    match dr {
+        0..=7 => Some(12 - dr),
+        _ => None,
+    }
 }
 
 impl Region {
@@ -80,6 +121,8 @@ impl Region {
             "EU868" | "EU" => Ok(Self::Eu868),
             "US915" | "US" => Ok(Self::Us915),
             "AS923" | "AS" | "AS923-1" => Ok(Self::As923_1),
+            "ISM2400" | "2.4" | "2G4" => Ok(Self::Ism2400),
+            "FCC-800" | "FCC800" | "809" => Ok(Self::Fcc800),
             _ => Err(HalError::Other(format!("unknown region {s}"))),
         }
     }
@@ -89,6 +132,9 @@ impl Region {
             Self::Eu868 => 868_300_000,
             Self::Us915 => 903_900_000,
             Self::As923_1 => 923_200_000,
+            Self::Ism2400 => ISM2400_CHANNELS_HZ[0],
+            // No published channel. 0 fails `contains`, so TX must pass an explicit Hz.
+            Self::Fcc800 => 0,
         }
     }
 
@@ -98,6 +144,9 @@ impl Region {
             Self::Eu868 => (863_000_000, 870_000_000),
             Self::Us915 => (902_000_000, 928_000_000),
             Self::As923_1 => (920_000_000, 925_000_000),
+            // Semtech ISM2400: devices operate 2400–2480 MHz.
+            Self::Ism2400 => (2_400_000_000, 2_480_000_000),
+            Self::Fcc800 => (809_000_000, 817_000_000),
         }
     }
 
@@ -111,6 +160,8 @@ impl Region {
             Self::Eu868 => "EU868",
             Self::Us915 => "US915",
             Self::As923_1 => "AS923-1",
+            Self::Ism2400 => "ISM2400",
+            Self::Fcc800 => "FCC-800",
         }
     }
 }
@@ -149,6 +200,11 @@ mod tests {
     fn region_as923_1_is_920_925() {
         let r = Region::parse("AS923-1").unwrap();
         assert_eq!(r, Region::parse("AS923").unwrap());
+        let g = Region::parse("ISM2400").unwrap();
+        assert!(g.contains(2_403_000_000));
+        assert_eq!(ism2400_sf(0), Some(12));
+        assert_eq!(ism2400_sf(7), Some(5));
+        assert!(ism2400_sf(8).is_none());
         assert_eq!(r.as_str(), "AS923-1");
         assert_eq!(r.default_tx_hz(), 923_200_000);
         assert_eq!(r.band_hz(), (920_000_000, 925_000_000));
@@ -157,5 +213,16 @@ mod tests {
         assert!(!r.contains(919_999_999));
         assert!(!r.contains(925_000_001));
         assert!(!r.contains(868_300_000));
+        let fcc = Region::parse("809").unwrap();
+        assert_eq!(fcc, Region::Fcc800);
+        assert!(fcc.contains(809_000_000) && fcc.contains(817_000_000));
+        assert!(!fcc.contains(902_000_000));
+        assert_eq!(fcc.default_tx_hz(), 0);
+        assert!(Region::Us915.contains(903_900_000));
+        assert_eq!(fcc800_uplink_hz(0), Some(809_012_500));
+        assert_eq!(fcc800_uplink_hz(638), Some(816_987_500));
+        assert_eq!(fcc800_downlink_hz(0), Some(854_012_500));
+        assert_eq!(fcc800_downlink_hz(638), Some(861_987_500));
+        assert!(fcc800_uplink_hz(639).is_none());
     }
 }

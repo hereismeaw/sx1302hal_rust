@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use sensecap_board::{inspect, reset_sensecap_m1};
 use sx1302_core::Region;
 use sx1302_firmware::{load_bin_or_var, AGC_FW, ARB_FW};
-use sx1302_hal::{Concentrator, TxRequest};
+use sx1302_hal::{ChannelPlan, Concentrator, TxRequest};
 use sx1302_transport::SpiConfig;
 use std::path::PathBuf;
 
@@ -59,7 +59,7 @@ enum Cmd {
         #[arg(long)]
         freq: Option<u32>,
     },
-    /// GPIO reset + radio + AGC/ARB + AS923-1 channelizer (920–925 MHz).
+    /// GPIO reset + radio + AGC/ARB. AS923-1, or US915 sub-band 2.
     Start {
         #[arg(long, default_value = "/dev/spidev0.0")]
         spi: String,
@@ -196,16 +196,26 @@ fn main() {
         }
         Cmd::Start { spi, region } => {
             let region = Region::parse(&region).unwrap_or(Region::As923_1);
-            if region != Region::As923_1 {
-                eprintln!("start currently programs AS923-1 channelizer only");
-                std::process::exit(1);
-            }
+            let plan = match region {
+                Region::As923_1 => ChannelPlan::as923_1_default(),
+                Region::Us915 => ChannelPlan::us915_sb2(),
+                Region::Fcc800 => {
+                    eprintln!(
+                        "FCC-800 is 809–817 MHz with no published channel plan, and this SX1250 has no image-cal row there"
+                    );
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!("start programs AS923-1 or US915 sub-band 2 only");
+                    std::process::exit(1);
+                }
+            };
             let _ = reset_sensecap_m1();
             let cfg = SpiConfig {
                 path: spi,
                 ..Default::default()
             };
-            match Concentrator::open(cfg).and_then(|c| c.start_as923_1()) {
+            match Concentrator::open(cfg).and_then(|c| c.start(&plan)) {
                 Ok(notes) => {
                     for n in notes {
                         println!("{n}");

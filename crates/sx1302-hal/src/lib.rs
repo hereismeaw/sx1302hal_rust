@@ -11,11 +11,18 @@ use sx1302_firmware::{
 use sx1302_radio::{self as radio, RadioStatus, RfChain};
 use sx1302_transport::{ConcentratorPort, SpiBus, SpiConfig};
 
+mod classb;
+mod gps;
 mod lorawan;
 mod pkt;
 mod plan;
 mod start;
 mod timestamp;
+pub use classb::{
+    beacon_antenna, beacon_payload, count_at, gps_ms, next_beacon_gps_ms, AS923_1_BEACON_HZ,
+    BEACON_DELAY_US,
+};
+pub use gps::{parse_rmc, Rmc};
 pub use lorawan::{MType, MacRev, PhyHdr};
 pub use pkt::{
     legacy_timestamp_correction_us, parse_rx_buffer, time_on_air_us, FskTx, RxDump, RxModulation,

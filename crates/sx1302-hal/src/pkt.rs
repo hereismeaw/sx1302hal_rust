@@ -166,9 +166,12 @@ pub struct TxRequest {
     /// External PA on (`pa_gain > 0`).
     #[serde(default)]
     pub pa_gain: u8,
-    /// LoRaWAN downlink = true (GWMP `ipol`).
+    /// LoRaWAN downlink = true (GWMP `ipol`). Class B beacons are non-inverted.
     #[serde(default)]
     pub invert_pol: bool,
+    /// Implicit header, LoRa CRC off. Class B beacons only.
+    #[serde(default)]
+    pub implicit: bool,
     /// LoRa symbols / FSK bytes.
     #[serde(default = "default_preamble")]
     pub preamble: u16,
@@ -209,6 +212,7 @@ impl TxRequest {
             power_idx: 17,
             pa_gain: 0,
             invert_pol: false,
+            implicit: false,
             preamble: 8,
             trigger: TxTrigger::Immediate,
             fsk: None,
@@ -240,8 +244,8 @@ impl TxRequest {
                 self.cr,
                 self.preamble,
                 self.payload.len(),
-                true,
-                false,
+                !self.implicit,
+                self.implicit,
             ),
         }
     }
@@ -644,6 +648,18 @@ impl Concentrator {
                 region: req.region,
             });
         }
+        if req.region == Region::Fcc800 {
+            // shortcut: Semtech sx1250_calibrate covers 779–787, not 809–817.
+            return Err(HalError::Other(
+                "FCC-800 is 809–817 MHz; SX1250 CALIBRATE_IMAGE has no row for that window".into(),
+            ));
+        }
+        if req.region == Region::Ism2400 {
+            // shortcut: SX1250 PLL is sub-GHz. ISM2400 needs an SX1280 (RAK5148's MCU protocol is not driven here).
+            return Err(HalError::Other(
+                "ISM2400 2.4 GHz is SX1280 LoRa at 812 kHz; this SX1250 frontend cannot tune it".into(),
+            ));
+        }
         if req.payload.is_empty() || req.payload.len() > 255 {
             return Err(HalError::Other("payload 1..=255".into()));
         }
@@ -743,8 +759,8 @@ impl Concentrator {
         port.write_u8(TX_A + 103, (preamble >> 8) as u8)?;
         port.rmw(TX_A + 98, 6, 1, 1)?; // MODEM_EN
         port.rmw(TX_A + 98, 4, 2, 2)?; // CADRXTX TX
-        port.rmw(TX_A + 98, 1, 1, 0)?; // explicit header
-        port.rmw(TX_A + 98, 0, 1, 1)?; // CRC_EN
+        port.rmw(TX_A + 98, 1, 1, u8::from(req.implicit))?;
+        port.rmw(TX_A + 98, 0, 1, u8::from(!req.implicit))?; // LoRa CRC off on a beacon
         port.rmw(TX_A + 101, 7, 1, 1)?; // MODEM_START
         port.rmw(TX_A + 105, 0, 1, 0)?; // not continuous
         port.rmw(TX_A + 105, 1, 1, u8::from(req.invert_pol))?; // CHIRP_INVERT (ipol)

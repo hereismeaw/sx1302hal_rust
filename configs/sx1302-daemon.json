@@ -1,6 +1,9 @@
 {
   "server": "192.168.0.101:1700",
   "stat_interval": 30,
+  "board": "sensecap-m1",
+  "class_b": false,
+  "gps": "",
   "plan": {
     "radio_hz": [922900000, 923700000],
     "multisf": [

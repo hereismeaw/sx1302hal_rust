@@ -349,6 +349,7 @@ name = "sx1302-daemon"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "sensecap-board",
  "serde",
  "serde_json",

@@ -1,20 +1,24 @@
 //! AS923-1 concentrator daemon: Semtech GWMP v2 (PUSH_DATA / PULL_DATA / PULL_RESP / TX_ACK)
 //! with a JIT downlink queue and a JSON channel plan.
 
+mod gps;
 mod jit;
 mod notify;
 
 use clap::Parser;
 use jit::JitQueue;
-use sensecap_board::reset_sensecap_m1;
+use sensecap_board::{reset_carrier, Carrier};
 use serde::Deserialize;
 use serde_json::json;
 use sx1302_core::Region;
-use sx1302_hal::{bw_hz_to_code, ChannelPlan, Concentrator, FskTx, TxGainLut, TxRequest, TxTrigger};
+use sx1302_hal::{
+    beacon_antenna, beacon_payload, bw_hz_to_code, count_at, gps_ms, next_beacon_gps_ms, ChannelPlan,
+    Concentrator, FskTx, TxGainLut, TxRequest, TxTrigger, AS923_1_BEACON_HZ, BEACON_DELAY_US,
+};
 use sx1302_transport::SpiConfig;
 use std::net::UdpSocket;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(name = "sx1302-daemon", about = "Native SX1302 GWMP forwarder (AS923-1)")]
@@ -43,6 +47,28 @@ struct Config {
     /// Semtech `tx_gain_lut` (rf_power / pa_gain / pwr_idx). Default = Semtech SX1250 table.
     #[serde(default)]
     tx_gain_lut: Option<TxGainLut>,
+    /// AS923-1 Class B beacons (923.4 MHz SF9) plus `tmms` ping slots.
+    /// Off unless set: this board has no PPS, so time is the host clock.
+    #[serde(default)]
+    class_b: bool,
+    /// 24-bit NetID written into the beacon (`InfoDesc = 3`) until a GPS fix exists.
+    #[serde(default)]
+    class_b_net_id: u32,
+    /// NMEA UART, 9600 8N1. RAK2287/RAK5146 Pi HAT: `/dev/ttyAMA0` when the ZOE-M8Q is fitted.
+    /// 1PPS is already wired to the concentrator. No fix yet: Class B keeps the host clock.
+    #[serde(default)]
+    gps: Option<String>,
+    /// `sensecap-m1` (default), `rak2287`, `rak5146`, or `rak5148`.
+    #[serde(default)]
+    board: Option<String>,
+}
+
+struct GpsLock {
+    gps_ms: u64,
+    count_us: u32,
+    lat_deg: f64,
+    lon_deg: f64,
+    at: Instant,
 }
 
 const PKT_PUSH_DATA: u8 = 0x00;
@@ -62,6 +88,8 @@ struct Stats {
     push_ack: u32,
     dwnb: u32,
     txnb: u32,
+    /// Downlinks refused because the JIT window overlapped a queued packet.
+    coll: u32,
 }
 
 fn main() {
@@ -82,11 +110,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let stat_interval = args.stat_interval.or(cfg.stat_interval).unwrap_or(30);
     let plan = cfg.plan.unwrap_or_else(ChannelPlan::as923_1_default);
     let lut = cfg.tx_gain_lut.unwrap_or_default();
-    plan.validate(Region::As923_1)?;
+    plan.band()?;
 
-    match reset_sensecap_m1() {
+    let carrier = Carrier::parse(cfg.board.as_deref().unwrap_or(""))?;
+    match reset_carrier(carrier) {
         Ok(n) => n.iter().for_each(|l| eprintln!("{l}")),
-        Err(e) => eprintln!("gpio: {e}"),
+        Err(e) => return Err(e.into()),
     }
     let c = Concentrator::open(SpiConfig {
         path: args.spi,
@@ -94,6 +123,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     for line in c.start(&plan)? {
         eprintln!("{line}");
+    }
+    if carrier == Carrier::Rak5146 {
+        match c.configure_timestamp(true) {
+            Ok(n) => n.iter().for_each(|l| eprintln!("{l}")),
+            Err(e) => eprintln!("fine timestamp: {e}"),
+        }
     }
     let eui = c.otp_eui().unwrap_or(0);
     eprintln!("gateway EUI {eui:016x}");
@@ -108,6 +143,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut st = Stats::default();
     let mut jit = JitQueue::default();
+    let mut last_beacon_ms: u64 = 0;
+    if cfg.class_b {
+        eprintln!("class B on: beacon 923.4 MHz SF9 every 128 s");
+    }
+    let mut gps_port = match cfg.gps.as_deref().filter(|p| !p.is_empty()) {
+        Some(path) => match gps::GpsPort::open(path) {
+            Ok(p) => {
+                if let Err(e) = c.enable_pps() {
+                    eprintln!("gps pps enable: {e}");
+                }
+                eprintln!("gps NMEA {path} (PPS lock replaces the host clock when a fix arrives)");
+                Some(p)
+            }
+            Err(e) => {
+                eprintln!("gps {path}: {e} (host clock)");
+                None
+            }
+        },
+        None => None,
+    };
+    let mut gps_lock: Option<GpsLock> = None;
+    let mut last_pps: Option<u32> = None;
+    let mut pps_edge: Option<(u32, Instant)> = None;
     let mut token: u16 = 1;
     let mut last_stat = Instant::now();
     let mut last_pull = Instant::now() - Duration::from_secs(10);
@@ -198,6 +256,94 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        if gps_port.is_some() {
+            if let Ok(Some(pps)) = c.pps_count_us() {
+                if last_pps != Some(pps) {
+                    last_pps = Some(pps);
+                    pps_edge = Some((pps, Instant::now()));
+                }
+            }
+            if let Some(port) = gps_port.as_mut() {
+                for rmc in port.poll() {
+                    if let Some((cnt, when)) = pps_edge {
+                        if when.elapsed() < Duration::from_millis(1200) {
+                            gps_lock = Some(GpsLock {
+                                gps_ms: rmc.gps_ms / 1000 * 1000,
+                                count_us: cnt,
+                                lat_deg: rmc.lat_deg,
+                                lon_deg: rmc.lon_deg,
+                                at: Instant::now(),
+                            });
+                            eprintln!("gps lock {} us at concentrator {cnt}", rmc.gps_ms);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(lock) = &gps_lock {
+            if lock.at.elapsed() > Duration::from_secs(10) {
+                eprintln!("gps lock stale, host clock");
+                gps_lock = None;
+            }
+        }
+
+        if cfg.class_b {
+            if let Ok(now) = c.now_us() {
+                let unix_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let (gps, origin) = match gps_lock.as_ref() {
+                    Some(lock) => (lock.gps_ms, lock.count_us),
+                    None => (gps_ms(unix_ms), now),
+                };
+                let boundary = next_beacon_gps_ms(gps);
+                if boundary != last_beacon_ms {
+                    let at = count_at(origin, gps, boundary).wrapping_add(BEACON_DELAY_US);
+                    let ahead = at.wrapping_sub(now) as i32;
+                    // Arm window is 100 ms; the TX timer rejects > 10 s at arm time,
+                    // so queue once the beacon is a few seconds out.
+                    if (2_000_000..9_000_000).contains(&ahead) {
+                        let payload = if let Some(lock) = gps_lock.as_ref() {
+                            beacon_antenna((boundary / 1000) as u32, lock.lat_deg, lock.lon_deg)
+                        } else {
+                            beacon_payload(
+                                (boundary / 1000) as u32,
+                                cfg.class_b_net_id,
+                                (eui & 0xff_ffff) as u32,
+                            )
+                        };
+                        let Ok(mut req) = TxRequest::as923_1_sf7(payload.to_vec()) else {
+                            eprintln!("class B beacon: bad frequency");
+                            last_beacon_ms = boundary;
+                            continue;
+                        };
+                        req.freq_hz = AS923_1_BEACON_HZ;
+                        req.sf = 9;
+                        req.bw = bw_hz_to_code(125_000).unwrap_or(0x04);
+                        req.cr = 1;
+                        req.preamble = 10;
+                        req.implicit = true;
+                        req.invert_pol = false;
+                        req.set_power(&lut, 14);
+                        req.trigger = TxTrigger::Timestamped(at);
+                        match jit.enqueue_within(req, Some(at), now, jit::MAX_AHEAD_CLASS_B_US) {
+                            Ok(()) => {
+                                last_beacon_ms = boundary;
+                                eprintln!("class B beacon queued gps_ms={boundary} tmst={at}");
+                            }
+                            Err(e) => {
+                                if e == jit::JitError::Collision {
+                                    st.coll += 1;
+                                }
+                                eprintln!("class B beacon: {}", e.gwmp());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // JIT: arm whatever is due.
         if jit.len() > 0 {
             let now = c.now_us()?;
@@ -220,17 +366,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     (100.0 * f64::from(st.push_ack) / f64::from(st.push_sent)).min(100.0)
                 };
-                let stat = json!({
-                    "stat": {
-                        "time": gwmp_time(),
-                        "rxnb": st.rxnb,
-                        "rxok": st.rxok,
-                        "rxfw": st.rxfw,
-                        "ackr": (ackr * 10.0).round() / 10.0,
-                        "dwnb": st.dwnb,
-                        "txnb": st.txnb
-                    }
-                });
+                let stat = stat_json(
+                    &gwmp_time(),
+                    &st,
+                    (ackr * 10.0).round() / 10.0,
+                    read_temp(&c),
+                    if gps_lock.is_some() { "pps" } else { "host" },
+                );
                 eprintln!("{stat}");
                 soft(push(s, token, eui, &stat.to_string()), "PUSH_DATA stat");
                 st = Stats {
@@ -279,14 +421,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let json = std::str::from_utf8(&buf[4..n]).unwrap_or("");
                         eprintln!("PULL_RESP {json}");
                         dl_seen += 1;
-                        let err = match parse_txpk(json, &lut) {
+                        let now_us = c.now_us().unwrap_or(0);
+                        let unix_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let (origin_gps, origin_cnt) = match gps_lock.as_ref() {
+                            Some(lock) => (lock.gps_ms, lock.count_us),
+                            None => (gps_ms(unix_ms), now_us),
+                        };
+                        let err = match parse_txpk(json, &lut, origin_cnt, origin_gps) {
                             Ok(_) if reject_alternate && dl_seen % 2 == 1 => {
                                 eprintln!("TEST MODE: rejecting this downlink (TOO_LATE)");
                                 "TOO_LATE"
                             }
-                            Ok((req, start)) => {
+                            Ok((req, start, horizon)) => {
                                 let now = c.now_us()?;
-                                match jit.enqueue(req, start, now) {
+                                match jit.enqueue_within(req, start, now, horizon) {
                                     Ok(()) => {
                                         eprintln!(
                                             "queued tmst={} (+{} ms), queue {}",
@@ -297,6 +448,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         "NONE"
                                     }
                                     Err(e) => {
+                                        if e == jit::JitError::Collision {
+                                            st.coll += 1;
+                                        }
                                         eprintln!("jit: {}", e.gwmp());
                                         e.gwmp()
                                     }
@@ -347,26 +501,49 @@ fn tx_ack(sock: &UdpSocket, token: u16, eui: u64, error: &str) -> std::io::Resul
     Ok(())
 }
 
-/// GWMP `txpk` -> request + emission time (`None` = immediate). Errors are GWMP codes.
-fn parse_txpk(json: &str, lut: &TxGainLut) -> Result<(TxRequest, Option<u32>), &'static str> {
+/// GWMP `txpk` -> request, emission time (`None` = immediate), and the JIT horizon.
+/// `tmms` is GPS milliseconds (Class B ping slot).
+/// `count_us` / `origin_gps_ms` are one paired sample (host clock, or a PPS lock).
+fn parse_txpk(
+    json: &str,
+    lut: &TxGainLut,
+    count_us: u32,
+    origin_gps_ms: u64,
+) -> Result<(TxRequest, Option<u32>, u32), &'static str> {
     let v: serde_json::Value = serde_json::from_str(json).map_err(|_| "COLLISION_PACKET")?;
     let tx = v.get("txpk").ok_or("COLLISION_PACKET")?;
     let freq = tx.get("freq").and_then(|x| x.as_f64()).ok_or("TX_FREQ")?;
     let freq_hz = (freq * 1_000_000.0).round() as u32;
-    if !Region::As923_1.contains(freq_hz) {
+    let region = if Region::As923_1.contains(freq_hz) {
+        Region::As923_1
+    } else if Region::Us915.contains(freq_hz) {
+        Region::Us915
+    } else if Region::Fcc800.contains(freq_hz) {
+        // shortcut: licensed 809–817 MHz, no Alliance raster, no SX1250 image-cal row.
+        eprintln!("txpk {freq_hz} Hz is FCC-800 (809–817); SX1250 image cal has no row there");
         return Err("TX_FREQ");
-    }
+    } else if Region::Ism2400.contains(freq_hz) {
+        eprintln!("txpk {freq_hz} Hz is ISM2400; SX1250 cannot transmit 2.4 GHz");
+        return Err("TX_FREQ");
+    } else {
+        return Err("TX_FREQ");
+    };
     let payload = b64_decode(tx.get("data").and_then(|x| x.as_str()).unwrap_or(""))
         .map_err(|_| "COLLISION_PACKET")?;
     let imme = tx.get("imme").and_then(|x| x.as_bool()).unwrap_or(false);
-    let start = if imme {
-        None
+    let (start, horizon) = if imme {
+        (None, jit::MAX_AHEAD_US)
+    } else if let Some(tmms) = tx.get("tmms").and_then(|x| x.as_u64()) {
+        let at = count_at(count_us, origin_gps_ms, tmms);
+        (Some(at), jit::MAX_AHEAD_CLASS_B_US)
+    } else if let Some(tmst) = tx.get("tmst").and_then(|x| x.as_u64()) {
+        (Some(tmst as u32), jit::MAX_AHEAD_US)
     } else {
-        // GPS `tmms` scheduling needs PPS (not on this carrier).
-        Some(tx.get("tmst").and_then(|x| x.as_u64()).ok_or("GPS_UNLOCKED")? as u32)
+        return Err("GPS_UNLOCKED");
     };
     let modu = tx.get("modu").and_then(|x| x.as_str()).unwrap_or("LORA");
     let mut req = TxRequest::as923_1_sf7(payload).map_err(|_| "TX_FREQ")?;
+    req.region = region;
     req.freq_hz = freq_hz;
     // GWMP `powe` (dBm, conducted) -> nearest LUT entry not above it.
     let powe = tx.get("powe").and_then(|x| x.as_i64()).unwrap_or(14).clamp(-128, 127) as i8;
@@ -403,7 +580,7 @@ fn parse_txpk(json: &str, lut: &TxGainLut) -> Result<(TxRequest, Option<u32>), &
         }
         _ => return Err("COLLISION_PACKET"),
     }
-    Ok((req, start))
+    Ok((req, start, horizon))
 }
 
 fn parse_datr(d: &str) -> Option<(u8, u32)> {
@@ -449,6 +626,25 @@ fn push(sock: &UdpSocket, token: u16, eui: u64, json: &str) -> std::io::Result<(
     pkt.extend_from_slice(json.as_bytes());
     sock.send(&pkt)?;
     Ok(())
+}
+
+/// GWMP `stat`. `temp` is the STTS751 reading. `time_src` is `pps` after a
+/// PPS+RMC lock and `host` otherwise. `coll` counts JIT collisions.
+fn stat_json(time: &str, st: &Stats, ackr: f64, temp: Option<f32>, time_src: &str) -> serde_json::Value {
+    json!({
+        "stat": {
+            "time": time,
+            "rxnb": st.rxnb,
+            "rxok": st.rxok,
+            "rxfw": st.rxfw,
+            "ackr": ackr,
+            "dwnb": st.dwnb,
+            "txnb": st.txnb,
+            "temp": temp,
+            "time_src": time_src,
+            "coll": st.coll
+        }
+    })
 }
 
 /// GWMP `stat.time`: "YYYY-MM-DD hh:mm:ss GMT".
@@ -506,16 +702,31 @@ mod tests {
     #[test]
     fn txpk_lora_and_fsk() {
         let lut = TxGainLut::default();
-        let (r, t) = parse_txpk(
+        let (r, t, h) = parse_txpk(
             r#"{"txpk":{"imme":false,"tmst":5000000,"freq":923.2,"powe":16,"modu":"LORA","datr":"SF10BW125","codr":"4/5","ipol":true,"data":"AQID"}}"#,
             &lut,
+            0,
+            0,
         )
         .unwrap();
         assert_eq!((r.sf, r.invert_pol, t), (10, true, Some(5_000_000)));
+        assert_eq!(h, jit::MAX_AHEAD_US);
         assert_eq!((r.pa_gain, r.power_idx), (0, 20)); // 16 dBm entry
-        let (r, t) = parse_txpk(
+        let (r, t, h) = parse_txpk(
+            r#"{"txpk":{"imme":false,"tmms":2000,"freq":923.4,"powe":14,"modu":"LORA","datr":"SF9BW125","codr":"4/5","ipol":true,"data":"AQID"}}"#,
+            &lut,
+            1_000_000,
+            0,
+        )
+        .unwrap();
+        assert_eq!(h, jit::MAX_AHEAD_CLASS_B_US);
+        assert!(!r.implicit);
+        assert_eq!(t, Some(1_000_000 + 2_000_000));
+        let (r, t, _) = parse_txpk(
             r#"{"txpk":{"imme":true,"freq":922.3,"powe":30,"modu":"FSK","datr":50000,"fdev":25000,"data":"AQID"}}"#,
             &lut,
+            0,
+            0,
         )
         .unwrap();
         assert_eq!(t, None);
@@ -524,11 +735,43 @@ mod tests {
         assert_eq!(
             parse_txpk(
                 r#"{"txpk":{"tmst":1,"freq":868.1,"modu":"LORA","datr":"SF7BW125","data":"AQ=="}}"#,
-                &lut
+                &lut,
+                0,
+                0,
             )
             .unwrap_err(),
             "TX_FREQ"
         );
+        let (r, _, _) = parse_txpk(
+            r#"{"txpk":{"imme":true,"freq":903.9,"modu":"LORA","datr":"SF7BW125","data":"AQ=="}}"#,
+            &lut,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(r.region, Region::Us915);
+        assert_eq!(
+            parse_txpk(
+                r#"{"txpk":{"imme":true,"freq":813.0,"modu":"LORA","datr":"SF7BW125","data":"AQ=="}}"#,
+                &lut,
+                0,
+                0,
+            )
+            .unwrap_err(),
+            "TX_FREQ"
+        );
+    }
+
+    #[test]
+    fn stat_reports_temp_clock_and_collisions() {
+        let mut st = Stats::default();
+        st.coll = 2;
+        let v = stat_json("2026-01-01 00:00:00 GMT", &st, 100.0, Some(31.5), "host");
+        let s = &v["stat"];
+        assert_eq!(s["temp"], 31.5);
+        assert_eq!(s["time_src"], "host");
+        assert_eq!(s["coll"], 2);
+        assert!(stat_json("", &Stats::default(), 0.0, None, "pps")["stat"]["temp"].is_null());
     }
 
     #[test]

@@ -22,6 +22,9 @@ pub struct FirmwareRef {
 
 /// Embedded Semtech AGC (SX1250) and ARB images, 8192 bytes each.
 pub const AGC_FW_SX1250: &[u8] = include_bytes!("../../../firmware/agc_fw_sx1250.bin");
+/// Semtech loads this same v10 image for an SX1303 with SX1250 front-ends.
+/// There is no separate SX1303 AGC blob in `sx1302_hal`.
+pub const AGC_FW_SX1303: &[u8] = AGC_FW_SX1250;
 pub const ARB_FW_BIN: &[u8] = include_bytes!("../../../firmware/arb_fw.bin");
 pub const FW_VERSION_AGC_SX1250: u8 = 10;
 pub const FW_VERSION_ARB: u8 = 2;
@@ -94,5 +97,6 @@ mod tests {
     fn embedded_fw_size() {
         assert_eq!(AGC_FW_SX1250.len(), MCU_FW_SIZE);
         assert_eq!(ARB_FW_BIN.len(), MCU_FW_SIZE);
+        assert!(std::ptr::eq(AGC_FW_SX1303, AGC_FW_SX1250));
     }
 }

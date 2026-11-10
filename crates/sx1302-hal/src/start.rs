@@ -3,7 +3,7 @@
 
 use crate::plan::{bw_hz_to_code, ChannelPlan, BW_125KHZ};
 use crate::Concentrator;
-use sx1302_core::{HalError, Region, Result};
+use sx1302_core::{HalError, Result};
 use sx1302_firmware::{
     AGC_MCU_CTRL, AGC_MCU_STATUS, ARB_MCU_CTRL, ARB_MCU_STATUS, FW_VERSION_AGC_SX1250,
     FW_VERSION_ARB, MCU_FW_SIZE,
@@ -116,9 +116,10 @@ impl Concentrator {
         self.plan.lock().unwrap().clone()
     }
 
-    /// `lgw_start` with an explicit RX channel plan (validated against AS923-1).
+    /// `lgw_start` with an explicit RX channel plan. The band is whichever
+    /// sub-GHz window both radios sit in (`ChannelPlan::band`).
     pub fn start(&self, plan: &ChannelPlan) -> Result<Vec<String>> {
-        plan.validate(Region::As923_1)?;
+        let region = plan.band()?;
         *self.plan.lock().unwrap() = plan.clone();
         let [freq_a, freq_b] = plan.radio_hz;
         let mut notes = Vec::new();
@@ -133,7 +134,7 @@ impl Concentrator {
         radio::setup_rx(&self.bus, RfChain::B, freq_b, plan.single_input_mode[1])?;
         radio::clock_select(&port, RfChain::A)?;
         port.rmw(COMMON_CTRL0, 3, 1, 0)?; // HOST_RADIO_CTRL = AGC (Semtech lgw_start)
-        notes.push(format!("radios in RX @ {freq_a}/{freq_b} Hz (AS923-1)"));
+        notes.push(format!("radios in RX @ {freq_a}/{freq_b} Hz ({region})"));
 
         port.rmw(0x5785, 4, 4, 0x04)?; // PA_LUT A
         port.rmw(0x5785, 0, 4, 0x02)?; // LNA_LUT A

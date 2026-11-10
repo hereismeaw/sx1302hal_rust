@@ -1,6 +1,6 @@
 # sx1302hal_rust
 
-A LoRa concentrator HAL for the Semtech SX1302, written in Rust from scratch.
+A LoRa concentrator HAL for the Semtech SX1302 (and the SX1303 on a RAK5146 SPI module), written in Rust from scratch.
 It talks to the chip over `spidev` directly. There's no C HAL underneath and no FFI.
 
 I built this on one particular box: a Raspberry Pi 5 inside an original
@@ -39,8 +39,12 @@ SF, and RSSI matched for both LoRa and FSK.
 
 ## What doesn't (yet)
 
-- **No GPS on this carrier**, so there's no PPS, no `tmms` scheduling and no
-  Class B.
+- **No GPS module is fitted.** Class B stays off unless `"class_b": true`.
+  Beacons are AS923-1 (923.4 MHz, SF9, every 128 s). Time is the host clock
+  until `"gps"` names an NMEA port (9600 8N1, for example `/dev/serial0`) and
+  the module's 1PPS reaches the SX1302. A valid RMC plus a PPS edge replaces
+  the host clock and puts the antenna coordinates in the beacon. Leave
+  `class_b` off beside a gateway that already beacons on GPS time.
 - **Fine timestamps** are SX1303-only. This unit is an SX1302.
 - **LBT / spectral scan** through the SX1262 isn't wired up. Its chip select
   shares SPI0 CE0 on the M1, so it needs a device-tree overlay first. Thailand
@@ -65,6 +69,16 @@ with this.
 | Temperature sensor | STTS751, I2C-1 `0x39` |
 | HAT LEDs | SX1302 GPIO0 (Config), GPIO2 (TX), GPIO4 (RX) |
 | **BCM 13** | AD5338R DAC: **never driven** by this code |
+
+`board` in the daemon config selects the carrier. `rak2287` (SX1302 SPI) and `rak5146` (SX1303 SPI) pulse BCM17 only and can use the onboard ZOE-M8Q (`"gps": "/dev/ttyAMA0"`). USB SKUs of those two cards are not on `spidev`. `rak5148` is a 2.4 GHz SX1280 USB module and stops at startup with that reason.
+
+LoRaWAN 2.4 GHz (`ISM2400`) is recognized: channels 2403 / 2425 / 2479 MHz, DR0–DR7 = SF12–SF5 at 812 kHz. A downlink in that band is answered `TX_FREQ`. The SX1250 on this HAL cannot tune it.
+
+`US915` lists all 72 RP002 channels: 64 uplinks at 902.3–914.9 MHz step 200 kHz, 8 uplinks at 903.0–914.2 MHz step 1.6 MHz, and 8 downlinks at 923.3–927.5 MHz step 600 kHz. The concentrator listens to one sub-band of eight 125 kHz channels plus the matching 500 kHz uplink. `sx1302-cli start --region US915` loads sub-band 2. The daemon accepts a US915 downlink. The default config stays AS923-1.
+
+`FCC-800` is the IotaComm FCC Part 90 block at 809.0–817.0 MHz. The channel list is the Part 90 12.5 kHz raster, 809.0125–816.9875 MHz (639 channels). Downlink is 45 MHz higher, 854.0125–861.9875 MHz, which matches the FSK range in the TEKTELIC gateway's FCC exhibit. That exhibit calls the 800 MHz radio FSK, not LoRa. Semtech's SX1250 image calibration has no row for 809 MHz, so a downlink there is answered `TX_FREQ`.
+
+The GWMP `stat` object adds `temp` (STTS751, degrees C), `time_src` (`pps` or `host`), and `coll` (downlinks dropped because the transmit queue overlapped). A RAK5146 turns on SX1303 fine timestamp. Semtech's AGC v10 image is the firmware for both the SX1302 and the SX1303 when the front-end is an SX1250.
 
 Two things that cost me time:
 

@@ -105,12 +105,45 @@ impl Concentrator {
         if fine {
             port.rmw(RX_TOP + 192, 2, 1, 0)?; // LEGACY_TIMESTAMP off
             port.write_u8(RX_TOP + 193, 32)?; // MAX_TS_METRICS
-            notes.push("precision timestamp (SX1303)".into());
+            // RX_TOP_TXRX_CFG9: fine-sync enable, one bit per SF5..SF12.
+            port.write_u8(0x5886, 0xFF)?;
+            notes.push(format!(
+                "precision timestamp (SX1303), AGC firmware v{} (Semtech SX1250 image, also the SX1303 image)",
+                sx1302_firmware::FW_VERSION_AGC_SX1250
+            ));
         } else {
             port.rmw(RX_TOP + 192, 2, 1, 1)?; // LEGACY_TIMESTAMP
             notes.push("legacy end-of-packet timestamp".into());
         }
         Ok(notes)
+    }
+
+    /// Latch the SX1302 PPS input. Leave this off until a GPS 1PPS wire is connected.
+    pub fn enable_pps(&self) -> Result<()> {
+        self.bus.sx1302().rmw(sx1302_registers::SX1302_REG_TIMESTAMP_BASE_ADDR, 0, 1, 1)?;
+        Ok(())
+    }
+
+    /// Concentrator µs latched by the last PPS edge, in the `tmst` domain.
+    /// `None` while the counter is still zero (no edge yet).
+    pub fn pps_count_us(&self) -> Result<Option<u32>> {
+        let _ = self.now_us()?;
+        let port = self.bus.sx1302();
+        let mut a = [0u8; 4];
+        let mut b = [0u8; 4];
+        port.read_burst(TS_PPS, &mut a)?;
+        port.read_burst(TS_PPS, &mut b)?;
+        let raw = if a[0] == b[0] {
+            u32::from_be_bytes(b)
+        } else {
+            let mut c = [0u8; 4];
+            port.read_burst(TS_PPS, &mut c)?;
+            u32::from_be_bytes(c)
+        };
+        if raw == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.expand_pkt_ts(raw)))
     }
 
     /// Free-running 32 MHz counter (`TIMESTAMP_INST`), same domain as RX packet timestamps.

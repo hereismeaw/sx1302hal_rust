@@ -164,6 +164,96 @@ impl ChannelPlan {
         }
     }
 
+    /// RP002 US915 channel `0..64`: 902.3 MHz + n × 200 kHz, 125 kHz, DR0–DR3.
+    pub fn us915_uplink_125_hz(ch: u8) -> Option<u32> {
+        if ch < 64 {
+            Some(902_300_000 + u32::from(ch) * 200_000)
+        } else {
+            None
+        }
+    }
+
+    /// RP002 US915 channel `64..72`: 903.0 MHz + n × 1.6 MHz, 500 kHz, DR4.
+    pub fn us915_uplink_500_hz(ch: u8) -> Option<u32> {
+        if ch < 8 {
+            Some(903_000_000 + u32::from(ch) * 1_600_000)
+        } else {
+            None
+        }
+    }
+
+    /// RP002 US915 downlink `0..8`: 923.3 MHz + n × 600 kHz, 500 kHz. TX only.
+    pub fn us915_downlink_hz(ch: u8) -> Option<u32> {
+        if ch < 8 {
+            Some(923_300_000 + u32::from(ch) * 600_000)
+        } else {
+            None
+        }
+    }
+
+    /// One of the eight US915 sub-bands (`0..8`). The SX1302 listens to that
+    /// sub-band's eight 125 kHz channels plus its 500 kHz uplink. Index 1 is
+    /// TTN FSB2 (channels 8–15 and 65).
+    pub fn us915_subband(index: u8) -> Option<Self> {
+        if index > 7 {
+            return None;
+        }
+        let base = 902_300_000 + u32::from(index) * 1_600_000;
+        let mut multisf = Vec::with_capacity(8);
+        for i in 0..4u32 {
+            multisf.push(MultiSfChan { radio: 0, freq_hz: base + i * 200_000 });
+        }
+        for i in 4..8u32 {
+            multisf.push(MultiSfChan { radio: 1, freq_hz: base + i * 200_000 });
+        }
+        Some(Self {
+            radio_hz: [base + 300_000, base + 1_100_000],
+            single_input_mode: default_single_input(),
+            rssi_offset: default_rssi_offset(),
+            rssi_tcomp: [RssiTcomp::default(); 2],
+            multisf,
+            lora_std: Some(LoraStdChan {
+                radio: 0,
+                freq_hz: Self::us915_uplink_500_hz(index).unwrap_or(base),
+                sf: 8,
+                bw_hz: 500_000,
+            }),
+            fsk: None,
+        })
+    }
+
+    /// US915 sub-band 2 (RP002 channels 8–15 + 500 kHz uplink 65).
+    pub fn us915_sb2() -> Self {
+        Self::us915_subband(1).expect("sub-band 1")
+    }
+
+    /// Band both radios sit in, then [`Self::validate`]. FCC-800 and ISM2400
+    /// are named so a plan aimed there fails with the reason, not a generic miss.
+    pub fn band(&self) -> Result<Region> {
+        let inside = |r: Region| self.radio_hz.iter().all(|f| r.contains(*f));
+        let region = if inside(Region::As923_1) {
+            Region::As923_1
+        } else if inside(Region::Us915) {
+            Region::Us915
+        } else if inside(Region::Eu868) {
+            Region::Eu868
+        } else if inside(Region::Fcc800) {
+            return Err(HalError::Other(
+                "FCC-800 is 809–817 MHz (IotaComm Part 90). No LoRa Alliance channel plan, and SX1250 CALIBRATE_IMAGE has no row for that window".into(),
+            ));
+        } else if inside(Region::Ism2400) {
+            return Err(HalError::Other(
+                "ISM2400 2.4 GHz is SX1280 LoRa at 812 kHz; this SX1250 frontend cannot tune it".into(),
+            ));
+        } else {
+            return Err(HalError::Other(
+                "channel plan radios are not inside one known sub-GHz band".into(),
+            ));
+        };
+        self.validate(region)?;
+        Ok(region)
+    }
+
     pub fn from_json(s: &str) -> Result<Self> {
         let p: Self =
             serde_json::from_str(s).map_err(|e| HalError::Other(format!("channel plan: {e}")))?;
@@ -255,6 +345,19 @@ mod tests {
         p.validate(Region::As923_1).unwrap();
         assert_eq!(p.if_hz(0, 922_600_000), -300_000);
         assert_eq!(p.if_hz(1, 924_000_000), 300_000);
+        let u = ChannelPlan::us915_sb2();
+        assert_eq!(u.band().unwrap(), Region::Us915);
+        assert_eq!(u.lora_std.unwrap().freq_hz, 904_600_000);
+        assert_eq!(ChannelPlan::us915_uplink_125_hz(0), Some(902_300_000));
+        assert_eq!(ChannelPlan::us915_uplink_125_hz(63), Some(914_900_000));
+        assert_eq!(ChannelPlan::us915_uplink_500_hz(7), Some(914_200_000));
+        assert_eq!(ChannelPlan::us915_downlink_hz(0), Some(923_300_000));
+        assert_eq!(ChannelPlan::us915_downlink_hz(7), Some(927_500_000));
+        assert!(ChannelPlan::us915_uplink_125_hz(64).is_none());
+        for i in 0..8 {
+            ChannelPlan::us915_subband(i).unwrap().validate(Region::Us915).unwrap();
+        }
+        assert!(ChannelPlan::us915_subband(8).is_none());
     }
 
     #[test]

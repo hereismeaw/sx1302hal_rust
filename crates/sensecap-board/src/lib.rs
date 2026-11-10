@@ -118,6 +118,44 @@ pub fn may_drive(pin: &BoardPin) -> Result<(), sx1302_core::HalError> {
 
 pub const GPIOCHIP: &str = "/dev/gpiochip0";
 
+/// Carrier the daemon resets before SPI bring-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carrier {
+    /// WM1302 on the SenseCAP M1: GPIO18 power, GPIO17 reset, GPIO5 SX1262.
+    SensecapM1,
+    /// RAK2287 SPI (SX1302). mPCIe 3.3 V is always on. Reset is GPIO17, active high.
+    Rak2287,
+    /// RAK5146 SPI (SX1303). Same reset pin as the RAK2287 Pi HAT.
+    Rak5146,
+    /// RAK5148: four SX1280s behind an STM32, USB only, 2.4 GHz. Not this HAL.
+    Rak5148,
+}
+
+impl Carrier {
+    pub fn parse(s: &str) -> Result<Self, sx1302_core::HalError> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "sensecap-m1" | "sensecap" | "wm1302" => Ok(Self::SensecapM1),
+            "rak2287" => Ok(Self::Rak2287),
+            "rak5146" => Ok(Self::Rak5146),
+            "rak5148" => Ok(Self::Rak5148),
+            _ => Err(sx1302_core::HalError::Other(format!(
+                "unknown board {s} (sensecap-m1, rak2287, rak5146, rak5148)"
+            ))),
+        }
+    }
+}
+
+pub fn reset_carrier(carrier: Carrier) -> Result<Vec<String>, sx1302_core::HalError> {
+    match carrier {
+        Carrier::SensecapM1 => reset_sensecap_m1(),
+        Carrier::Rak2287 | Carrier::Rak5146 => reset_rak_spi(carrier),
+        Carrier::Rak5148 => Err(sx1302_core::HalError::Other(
+            "RAK5148 is a 2.4 GHz SX1280 USB concentrator (STM32), not an SX1302/SX1303 SPI device"
+                .into(),
+        )),
+    }
+}
+
 /// SenseCAP M1 concentrator GPIO sequence (skip BCM13).
 /// POWER_EN HIGH, SX1302_RESET pulse HIGH then LOW, SX1262_RESET pulse LOW then HIGH.
 pub fn reset_sensecap_m1() -> Result<Vec<String>, sx1302_core::HalError> {
@@ -196,6 +234,40 @@ fn persist_pinctrl(notes: &mut Vec<String>) {
         .args(["set", "5", "op", "dh"])
         .status();
     notes.push("pinctrl persist: 18 op dh, 17 op dl, 5 op dh".into());
+}
+
+/// RAK2287 / RAK5146 SPI on the RAK Pi HAT: PERST# is BCM17, active high, then release.
+/// No POWER_EN. USB SKUs (RAK2287-A/C, RAK5146-x2x) are not on this SPI bus.
+#[cfg(target_os = "linux")]
+fn reset_rak_spi(carrier: Carrier) -> Result<Vec<String>, sx1302_core::HalError> {
+    use gpiocdev::Request;
+    use gpiocdev::line::Value;
+    use std::thread::sleep;
+    use std::time::Duration;
+    let mut notes = Vec::new();
+    let reset = Request::builder()
+        .on_chip(GPIOCHIP)
+        .with_line(17)
+        .as_output(Value::Active)
+        .request()
+        .map_err(|e| sx1302_core::HalError::Io(format!("GPIO17 RESET: {e}")))?;
+    notes.push(format!("{carrier:?} GPIO17 RESET = HIGH"));
+    sleep(Duration::from_millis(100));
+    reset
+        .set_value(17, Value::Inactive)
+        .map_err(|e| sx1302_core::HalError::Io(format!("GPIO17 deassert: {e}")))?;
+    notes.push("GPIO17 RESET = LOW".into());
+    sleep(Duration::from_millis(100));
+    let _ = std::process::Command::new("pinctrl")
+        .args(["set", "17", "op", "dl"])
+        .status();
+    let _ = reset;
+    Ok(notes)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reset_rak_spi(_: Carrier) -> Result<Vec<String>, sx1302_core::HalError> {
+    Err(sx1302_core::HalError::Unsupported("Linux gpiochip required"))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -323,6 +395,13 @@ mod tests {
             .find(|p| p.bcm == 13)
             .unwrap();
         assert!(may_drive(&p).is_err());
+    }
+
+    #[test]
+    fn rak_names() {
+        assert_eq!(Carrier::parse("rak2287").unwrap(), Carrier::Rak2287);
+        assert_eq!(Carrier::parse("RAK5146").unwrap(), Carrier::Rak5146);
+        assert!(reset_carrier(Carrier::Rak5148).is_err());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Just-in-time TX queue (like `lora_pkt_fwd` `jitqueue.c`, class A/C only).
+//! Just-in-time TX queue (like `lora_pkt_fwd` `jitqueue.c`).
 //!
 //! Downlinks are accepted (TX_ACK) when queued and armed on the concentrator
 //! `LEAD_US` before their emission time, so several JoinAccepts / RX1 / RX2
@@ -10,8 +10,10 @@ use sx1302_hal::TxRequest;
 pub const LEAD_US: u32 = 100_000;
 /// Refuse packets that cannot be programmed in time.
 pub const MIN_AHEAD_US: u32 = 20_000;
-/// Refuse packets scheduled too far ahead (Class A RX2 JoinAccept is 6 s).
+/// Refuse Class A packets scheduled too far ahead (RX2 JoinAccept is 6 s).
 pub const MAX_AHEAD_US: u32 = 30_000_000;
+/// Class B ping slots and beacons can be queued up to one beacon period ahead.
+pub const MAX_AHEAD_CLASS_B_US: u32 = 130_000_000;
 /// Spacing kept after a packet's air time before the next one may be armed.
 pub const GUARD_US: u32 = 5_000;
 
@@ -61,8 +63,19 @@ impl JitQueue {
         self.items.len()
     }
 
-    /// `start_us = None` = immediate.
+    /// `start_us = None` = immediate. Class A horizon.
     pub fn enqueue(&mut self, req: TxRequest, start_us: Option<u32>, now: u32) -> Result<(), JitError> {
+        self.enqueue_within(req, start_us, now, MAX_AHEAD_US)
+    }
+
+    /// `max_ahead_us` is [`MAX_AHEAD_CLASS_B_US`] for `tmms` and beacons.
+    pub fn enqueue_within(
+        &mut self,
+        req: TxRequest,
+        start_us: Option<u32>,
+        now: u32,
+        max_ahead_us: u32,
+    ) -> Result<(), JitError> {
         let toa_us = req.time_on_air_us();
         let item = match start_us {
             None => Item { start_us: now, immediate: true, toa_us, req },
@@ -71,7 +84,7 @@ impl JitQueue {
                 if ahead < MIN_AHEAD_US as i32 {
                     return Err(JitError::TooLate);
                 }
-                if ahead > MAX_AHEAD_US as i32 {
+                if ahead > max_ahead_us as i32 {
                     return Err(JitError::TooEarly);
                 }
                 Item { start_us: t, immediate: false, toa_us, req }
