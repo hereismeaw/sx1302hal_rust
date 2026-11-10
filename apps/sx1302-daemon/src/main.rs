@@ -165,7 +165,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut gps_lock: Option<GpsLock> = None;
     let mut last_pps: Option<u32> = None;
-    let mut pps_edge: Option<(u32, Instant)> = None;
+    let mut pps_edge: Option<(u32, u64, Instant)> = None;
+    let mut last_rtc = Instant::now() - Duration::from_secs(3600);
     let mut token: u16 = 1;
     let mut last_stat = Instant::now();
     let mut last_pull = Instant::now() - Duration::from_secs(10);
@@ -260,13 +261,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(Some(pps)) = c.pps_count_us() {
                 if last_pps != Some(pps) {
                     last_pps = Some(pps);
-                    pps_edge = Some((pps, Instant::now()));
+                    if let Ok(conc) = c.now_us() {
+                        let host = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        if let Some(at_edge) = gps::host_ms_at_pps(host, conc, pps) {
+                            pps_edge = Some((pps, at_edge, Instant::now()));
+                        }
+                    }
                 }
             }
             if let Some(port) = gps_port.as_mut() {
                 for rmc in port.poll() {
-                    if let Some((cnt, when)) = pps_edge {
+                    if let Some((cnt, host_at_edge, when)) = pps_edge {
                         if when.elapsed() < Duration::from_millis(1200) {
+                            let fresh = gps_lock.is_none();
                             gps_lock = Some(GpsLock {
                                 gps_ms: rmc.gps_ms / 1000 * 1000,
                                 count_us: cnt,
@@ -274,7 +284,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 lon_deg: rmc.lon_deg,
                                 at: Instant::now(),
                             });
-                            eprintln!("gps lock {} us at concentrator {cnt}", rmc.gps_ms);
+                            if fresh {
+                                eprintln!("gps lock {} us at concentrator {cnt}", rmc.gps_ms);
+                            }
+                            let delta = host_at_edge as i64 - rmc.unix_ms as i64;
+                            // 20 ms is above one SPI read of the counter and below a useful step.
+                            if delta.unsigned_abs() > 20 {
+                                let Some(conc) = c.now_us().ok() else { continue };
+                                let Some(target) = gps::unix_ms_now(rmc.unix_ms, conc, cnt) else { continue };
+                                let write_rtc = delta.unsigned_abs() >= 1000 || last_rtc.elapsed() > Duration::from_secs(600);
+                                match gps::step_host_and_rtc(target, write_rtc) {
+                                    Ok(()) => {
+                                        eprintln!("host clock stepped {delta} ms from GPS");
+                                        if write_rtc {
+                                            last_rtc = Instant::now();
+                                        }
+                                    }
+                                    Err(e) => eprintln!("host clock step: {e}"),
+                                }
+                            }
                         }
                     }
                 }

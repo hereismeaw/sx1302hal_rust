@@ -7,6 +7,8 @@ use crate::classb::gps_ms;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rmc {
     pub gps_ms: u64,
+    /// UTC Unix milliseconds from the sentence, before the leap-second conversion.
+    pub unix_ms: u64,
     pub lat_deg: f64,
     pub lon_deg: f64,
 }
@@ -27,7 +29,7 @@ pub fn parse_rmc(line: &str) -> Option<Rmc> {
     let unix_ms = unix_ms_rmc(f[1], f[9])?;
     let lat = nmea_deg(f[3], f[4], "S")?;
     let lon = nmea_deg(f[5], f[6], "W")?;
-    Some(Rmc { gps_ms: gps_ms(unix_ms), lat_deg: lat, lon_deg: lon })
+    Some(Rmc { gps_ms: gps_ms(unix_ms), unix_ms, lat_deg: lat, lon_deg: lon })
 }
 
 /// Signed 24-bit beacon coordinate. `span` is 90 for latitude and 180 for longitude.
@@ -108,6 +110,7 @@ mod tests {
         // 2024-01-01 00:00:00 UTC. gps = unix - 315964800 + 18.
         let line = frame("GNRMC,000000.00,A,1345.0000,N,10030.0000,E,0.0,0.0,010124,,,A");
         let r = parse_rmc(&line).unwrap();
+        assert_eq!(r.unix_ms, 1_704_067_200_000);
         assert_eq!(r.gps_ms, (1_704_067_200 - 315_964_800 + 18) * 1000);
         assert!((r.lat_deg - 13.75).abs() < 1e-6);
         assert!((r.lon_deg - 100.5).abs() < 1e-6);

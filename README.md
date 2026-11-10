@@ -70,7 +70,7 @@ with this.
 | HAT LEDs | SX1302 GPIO0 (Config), GPIO2 (TX), GPIO4 (RX) |
 | **BCM 13** | AD5338R DAC: **never driven** by this code |
 
-`board` in the daemon config selects the carrier. `rak2287` (SX1302 SPI) and `rak5146` (SX1303 SPI) pulse BCM17 only and can use the onboard ZOE-M8Q (`"gps": "/dev/ttyAMA0"`). USB SKUs of those two cards are not on `spidev`. `rak5148` is a 2.4 GHz SX1280 USB module and stops at startup with that reason.
+`board` in the daemon config selects the carrier. `rak2287` (SX1302 SPI) and `rak5146` (SX1303 SPI) pulse BCM17 only and can use the onboard ZOE-M8Q (`"gps": "/dev/ttyAMA0"`). A PPS+RMC lock measures the edge from the SX1302 counter and steps the kernel clock when it is more than 20 ms off. `hwclock --systohc` runs on a step of a second or more, and at most every 10 minutes after that. The daemon needs permission to set the clock. A missing `hwclock` leaves the kernel clock set and the RTC unchanged. USB SKUs of those two cards are not on `spidev`. `rak5148` is a 2.4 GHz SX1280 USB module and stops at startup with that reason.
 
 LoRaWAN 2.4 GHz (`ISM2400`) is recognized: channels 2403 / 2425 / 2479 MHz, DR0–DR7 = SF12–SF5 at 812 kHz. A downlink in that band is answered `TX_FREQ`. The SX1250 on this HAL cannot tune it.
 
