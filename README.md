@@ -98,7 +98,7 @@ sudo ./target/release/sx1302-cli tx-pkt --region AS923-1 --payload 47573031
 ```bash
 sudo install -m755 target/release/sx1302-daemon target/release/sx1302-cli /usr/local/bin/
 sudo install -m644 configs/sx1302-daemon.json /etc/sx1302-daemon.json
-echo 'SX1302_SERVER=your-chirpstack:1700' | sudo tee /etc/default/sx1302-daemon
+echo 'SX1302_SERVER=your-lns-ttn-or-chirpstack:1700' | sudo tee /etc/default/sx1302-daemon
 sudo install -m644 systemd/sx1302-daemon.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now sx1302-daemon
 
