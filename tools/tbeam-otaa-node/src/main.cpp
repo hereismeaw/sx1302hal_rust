@@ -1,6 +1,7 @@
-//! T-Beam v1.1 LoRaWAN 1.0.3 OTAA node, AS923-1, for the sx1302-hal-rs gateway.
-//! Joins via ChirpStack, then sends a confirmed uplink every 30 s so each uplink
-//! needs an RX1 ACK from the gateway. DevNonce persisted in NVS (ChirpStack rejects reuse).
+//! T-Beam v1.1 OTAA node, AS923-1, for the sx1302-hal-rs gateway.
+//! RadioLib treats equal NwkKey and AppKey as LoRaWAN 1.0.x, and different keys as 1.1
+//! (NwkKey + AppKey, four session keys). DevNonce persisted in NVS.
+//! shortcut: RadioLib 7.1 has no LoRaWAN 1.2 session. Keep forwarding on the gateway.
 
 #include <Arduino.h>
 #include <Preferences.h>
@@ -28,7 +29,12 @@ LoRaWANNode node(&radio, &AS923);
 Preferences prefs;
 
 static uint8_t app_key[16] = OTAA_APP_KEY;
-static uint8_t nwk_key[16] = OTAA_APP_KEY; // LoRaWAN 1.0.x: single root key
+// Define OTAA_NWK_KEY in keys.h for LoRaWAN 1.1. Omit it to stay on 1.0.x.
+#ifdef OTAA_NWK_KEY
+static uint8_t nwk_key[16] = OTAA_NWK_KEY;
+#else
+static uint8_t nwk_key[16] = OTAA_APP_KEY;
+#endif
 static uint32_t counter = 0;
 
 static void pmu_power_lora() {

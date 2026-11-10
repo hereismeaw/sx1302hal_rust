@@ -11,10 +11,12 @@ use sx1302_firmware::{
 use sx1302_radio::{self as radio, RadioStatus, RfChain};
 use sx1302_transport::{ConcentratorPort, SpiBus, SpiConfig};
 
+mod lorawan;
 mod pkt;
 mod plan;
 mod start;
 mod timestamp;
+pub use lorawan::{MType, MacRev, PhyHdr};
 pub use pkt::{
     legacy_timestamp_correction_us, parse_rx_buffer, time_on_air_us, FskTx, RxDump, RxModulation,
     RxPacket, TxGain, TxGainLut, TxRequest, TxTrigger, RSSI_OFFSET_SX1250,

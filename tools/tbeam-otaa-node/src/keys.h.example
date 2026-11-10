@@ -1,0 +1,8 @@
+#pragma once
+// Copy to keys.h. Same NwkKey and AppKey => LoRaWAN 1.0.x.
+// A different OTAA_NWK_KEY => LoRaWAN 1.1 (ChirpStack device profile macVersion 1.1.0).
+
+#define OTAA_JOIN_EUI 0x0000000000000000ULL
+#define OTAA_DEV_EUI  0x0000000000000000ULL
+#define OTAA_APP_KEY { 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0 }
+// #define OTAA_NWK_KEY { 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0 }

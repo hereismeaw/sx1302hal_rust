@@ -180,6 +180,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 !dup
             });
+            for p in &ok {
+                if let Some(note) = sx1302_hal::PhyHdr::parse(&p.payload).and_then(|h| h.note()) {
+                    eprintln!("{note}");
+                }
+            }
             let rxpk: Vec<_> = ok.iter().map(|p| p.to_rxpk()).collect();
             if !rxpk.is_empty() {
                 let body = json!({ "rxpk": rxpk });

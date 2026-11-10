@@ -121,8 +121,11 @@ The daemon holds the SPI bus. Stop the service before using `sx1302-cli`.
   downlink actually arrived.
 - [`tools/gwmp_echo_ns.py`](tools/gwmp_echo_ns.py): a tiny fake network server
   that answers each test uplink at +1 s / +2 s.
-- [`tools/tbeam-otaa-node`](tools/tbeam-otaa-node): a real LoRaWAN 1.0.3 OTAA
-  node (RadioLib). Put your keys in `src/keys.h`; that file is git-ignored.
+- [`tools/tbeam-otaa-node`](tools/tbeam-otaa-node): a real OTAA node (RadioLib).
+  Put your keys in `src/keys.h` (git-ignored). `OTAA_APP_KEY` alone is LoRaWAN 1.0.x.
+  Add a different `OTAA_NWK_KEY` for 1.1. The gateway forwards the PHY unchanged,
+  including 1.1 Rejoin-Request. LoRaWAN 1.2 has no public L2 spec; a non-zero
+  Major is still forwarded.
 - [`tools/semtech-ref`](tools/semtech-ref): how to build and run Semtech's
   `lora_pkt_fwd` on the same board for an A/B comparison.
 
