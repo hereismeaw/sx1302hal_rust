@@ -34,6 +34,12 @@ struct Args {
     /// Seconds between `stat` reports. Overrides the config.
     #[arg(long)]
     stat_interval: Option<u64>,
+    /// Longest TX air time in ms (AS923 dwell time is 400). 0 = no limit. Overrides the config.
+    #[arg(long)]
+    dwell_ms: Option<u32>,
+    /// TX air time allowed per sliding hour, in percent. 0 = no limit. Overrides the config.
+    #[arg(long)]
+    duty_cycle_percent: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -44,6 +50,15 @@ struct Config {
     stat_interval: Option<u64>,
     #[serde(default)]
     plan: Option<ChannelPlan>,
+    /// Preset plan when `plan` is absent: `AS923-1`, `US915` or `FCC-800`.
+    #[serde(default)]
+    region: Option<String>,
+    /// 0-based sub-band of the preset: US915 0–7 (default 1), FCC-800 0–4 (default 0).
+    #[serde(default)]
+    subband: Option<u8>,
+    /// Listen to several channel blocks in turn. Off when absent.
+    #[serde(default)]
+    hop: Option<HopConfig>,
     /// Semtech `tx_gain_lut` (rf_power / pa_gain / pwr_idx). Default = Semtech SX1250 table.
     #[serde(default)]
     tx_gain_lut: Option<TxGainLut>,
@@ -61,7 +76,62 @@ struct Config {
     /// `sensecap-m1` (default), `rak2287`, `rak5146`, or `rak5148`.
     #[serde(default)]
     board: Option<String>,
+    /// Refuse any TX longer than this on air (AS923 dwell time is 400). Off when absent or 0.
+    #[serde(default)]
+    dwell_ms: Option<u32>,
+    /// TX air-time limit over a sliding hour, all channels, beacons included (e.g. 1.0).
+    /// Off when absent or 0.
+    #[serde(default)]
+    duty_cycle_percent: Option<f64>,
 }
+
+/// One SX1302 demodulates eight 125 kHz channels. Hopping restarts it on the next
+/// block every `dwell_s`, so uplinks on the other blocks are missed meanwhile.
+/// Each block is the base plan moved by one entry of `shift_hz`, or by
+/// `0, step_hz, 2·step_hz, …` (`steps` entries). All eight US915 sub-bands from
+/// sub-band 0: `{"dwell_s": 20, "step_hz": 1600000, "steps": 8}`.
+#[derive(Deserialize, Default, Clone)]
+struct HopConfig {
+    /// Seconds on each block (minimum 5).
+    dwell_s: u64,
+    #[serde(default)]
+    shift_hz: Vec<i64>,
+    #[serde(default)]
+    step_hz: i64,
+    #[serde(default)]
+    steps: u32,
+}
+
+/// The plans to cycle through, each checked against the region of the base plan.
+fn hop_plans(base: &ChannelPlan, region: Region, hop: &HopConfig) -> Result<Vec<ChannelPlan>, String> {
+    let shifts: Vec<i64> = if hop.shift_hz.is_empty() {
+        (0..i64::from(hop.steps)).map(|i| i * hop.step_hz).collect()
+    } else {
+        hop.shift_hz.clone()
+    };
+    if shifts.len() < 2 {
+        return Err("hop: give at least two blocks (`shift_hz`, or `step_hz` + `steps`)".into());
+    }
+    shifts
+        .iter()
+        .map(|d| {
+            let p = base.shifted(*d).map_err(|e| format!("hop {d} Hz: {e}"))?;
+            p.validate(region).map_err(|e| format!("hop {d} Hz: {e}"))?;
+            Ok(p)
+        })
+        .collect()
+}
+
+struct Hop {
+    plans: Vec<ChannelPlan>,
+    dwell: Duration,
+    idx: usize,
+    since: Instant,
+}
+
+/// No hop until this long after the last uplink: a Class A answer (RX2 of a
+/// JoinAccept is 6 s) may still be on its way from the server.
+const HOP_QUIET: Duration = Duration::from_secs(7);
 
 struct GpsLock {
     gps_ms: u64,
@@ -108,9 +178,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let server = args.server.or(cfg.server).unwrap_or_default();
     let stat_interval = args.stat_interval.or(cfg.stat_interval).unwrap_or(30);
-    let plan = cfg.plan.unwrap_or_else(ChannelPlan::as923_1_default);
+    let plan = match (cfg.plan, cfg.region.as_deref()) {
+        (Some(p), _) => p,
+        (None, Some(r)) => ChannelPlan::preset(Region::parse(r)?, cfg.subband)?,
+        (None, None) => ChannelPlan::as923_1_default(),
+    };
     let lut = cfg.tx_gain_lut.unwrap_or_default();
-    plan.band()?;
+    let region = plan.band()?;
+    let mut hop = match &cfg.hop {
+        Some(h) => {
+            let plans = hop_plans(&plan, region, h)?;
+            let dwell = Duration::from_secs(h.dwell_s.max(5));
+            eprintln!(
+                "hopping over {} blocks in {region}, {} s each (uplinks on the other blocks are missed)",
+                plans.len(),
+                dwell.as_secs()
+            );
+            Some(Hop { plans, dwell, idx: 0, since: Instant::now() })
+        }
+        None => None,
+    };
+    let plan = hop.as_ref().map_or(plan, |h| h.plans[0].clone());
+    let dwell_ms = args.dwell_ms.or(cfg.dwell_ms).filter(|d| *d > 0);
+    let duty_cycle_percent = args.duty_cycle_percent.or(cfg.duty_cycle_percent).filter(|d| *d > 0.0);
 
     let carrier = Carrier::parse(cfg.board.as_deref().unwrap_or(""))?;
     match reset_carrier(carrier) {
@@ -121,14 +211,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         path: args.spi,
         ..Default::default()
     })?;
+    // SX1303: ask for the precision timestamp before start (ARB dual demodulation
+    // is set while the firmware starts). `start` falls back to legacy on an SX1302.
+    c.set_fine_timestamp(carrier == Carrier::Rak5146);
     for line in c.start(&plan)? {
         eprintln!("{line}");
-    }
-    if carrier == Carrier::Rak5146 {
-        match c.configure_timestamp(true) {
-            Ok(n) => n.iter().for_each(|l| eprintln!("{l}")),
-            Err(e) => eprintln!("fine timestamp: {e}"),
-        }
     }
     let eui = c.otp_eui().unwrap_or(0);
     eprintln!("gateway EUI {eui:016x}");
@@ -143,6 +230,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut st = Stats::default();
     let mut jit = JitQueue::default();
+    let mut air = jit::Airtime::new(dwell_ms, duty_cycle_percent);
+    eprintln!(
+        "TX limits: dwell {}, duty cycle {}",
+        dwell_ms.map_or("off".into(), |d| format!("{d} ms")),
+        duty_cycle_percent.map_or("off".into(), |d| format!("{d} % per hour"))
+    );
+    let mut last_rx = Instant::now() - HOP_QUIET;
+    let started = Instant::now();
     let mut last_beacon_ms: u64 = 0;
     if cfg.class_b {
         eprintln!("class B on: beacon 923.4 MHz SF9 every 128 s");
@@ -204,7 +299,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         if last_health.elapsed() >= wd_every.unwrap_or(Duration::from_secs(10)) {
             // Err here exits -> systemd restarts -> GPIO reset + full start.
-            health_ts = Some(c.health_check(health_ts).map_err(|e| format!("health check: {e}"))?);
+            let ts = c.health_check(health_ts).map_err(|e| format!("health check: {e}"))?;
+            health_ts = Some(ts);
+            jit.expire(ts);
             last_health = Instant::now();
             let temp = read_temp(&c);
             if wd_every.is_some() {
@@ -226,8 +323,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             st.rxok += dump.packets.iter().filter(|p| p.stat == 1).count() as u32;
             // Like lora_pkt_fwd: forward CRC-OK only. The multi-SF chain and the LoRa
             // service modem can both demodulate one frame: keep the best-SNR copy.
+            // SX1303 dual demodulation also gives two copies: like `lgw_receive`,
+            // keep the one that carries the fine timestamp.
             let mut ok: Vec<_> = dump.packets.iter().filter(|p| p.stat == 1).collect();
-            ok.sort_by(|a, b| b.snr.total_cmp(&a.snr));
+            ok.sort_by(|a, b| {
+                b.ftime_ns
+                    .is_some()
+                    .cmp(&a.ftime_ns.is_some())
+                    .then(b.snr.total_cmp(&a.snr))
+            });
             let mut seen: Vec<(u32, &[u8])> = Vec::new();
             ok.retain(|p| {
                 let dup = seen.iter().any(|(t, d)| {
@@ -246,6 +350,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let rxpk: Vec<_> = ok.iter().map(|p| p.to_rxpk()).collect();
             if !rxpk.is_empty() {
+                last_rx = Instant::now();
                 let body = json!({ "rxpk": rxpk });
                 println!("{body}");
                 if let Some(s) = &sock {
@@ -329,9 +434,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if boundary != last_beacon_ms {
                     let at = count_at(origin, gps, boundary).wrapping_add(BEACON_DELAY_US);
                     let ahead = at.wrapping_sub(now) as i32;
-                    // Arm window is 100 ms; the TX timer rejects > 10 s at arm time,
-                    // so queue once the beacon is a few seconds out.
-                    if (2_000_000..9_000_000).contains(&ahead) {
+                    // Queue inside the last 9 s so the clock mapping is fresh. The JIT queue
+                    // arms 100 ms before emission and takes anything >= MIN_AHEAD_US out,
+                    // so a late loop still sends the beacon. Later than that: TOO_LATE, once.
+                    if ahead < 9_000_000 {
                         let payload = if let Some(lock) = gps_lock.as_ref() {
                             beacon_antenna((boundary / 1000) as u32, lock.lat_deg, lock.lon_deg)
                         } else {
@@ -355,16 +461,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         req.invert_pol = false;
                         req.set_power(&lut, 14);
                         req.trigger = TxTrigger::Timestamped(at);
-                        match jit.enqueue_within(req, Some(at), now, jit::MAX_AHEAD_CLASS_B_US) {
-                            Ok(()) => {
-                                last_beacon_ms = boundary;
-                                eprintln!("class B beacon queued gps_ms={boundary} tmst={at}");
-                            }
+                        // One attempt per beacon: a refusal cannot clear before the slot.
+                        last_beacon_ms = boundary;
+                        let mono_ms = started.elapsed().as_millis() as u64;
+                        match submit(&mut jit, &mut air, req, Some(at), now, jit::MAX_AHEAD_CLASS_B_US, mono_ms) {
+                            Ok(()) => eprintln!(
+                                "class B beacon queued gps_ms={boundary} tmst={at} (+{} ms)",
+                                ahead / 1000
+                            ),
                             Err(e) => {
                                 if e == jit::JitError::Collision {
                                     st.coll += 1;
                                 }
-                                eprintln!("class B beacon: {}", e.gwmp());
+                                eprintln!("class B beacon gps_ms={boundary} skipped: {}", e.reason());
                             }
                         }
                     }
@@ -384,6 +493,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(e) => eprintln!("jit arm: {e}"),
                 }
+            }
+        }
+
+        // Hop to the next block: same path as a service restart (GPIO reset + start),
+        // so the counter restarts. Wait until nothing is queued or on the air and the
+        // channel has been quiet; after two dwell times hop even if uplinks keep coming.
+        if let Some(h) = hop.as_mut() {
+            let waited = h.since.elapsed();
+            if waited >= h.dwell
+                && jit.len() == 0
+                && (last_rx.elapsed() >= HOP_QUIET || waited >= h.dwell * 2)
+                && !jit.on_air(c.now_us()?)
+            {
+                let next = (h.idx + 1) % h.plans.len();
+                let t0 = Instant::now();
+                reset_carrier(carrier)?;
+                c.start(&h.plans[next])?;
+                if gps_port.is_some() {
+                    if let Err(e) = c.enable_pps() {
+                        eprintln!("gps pps enable: {e}");
+                    }
+                }
+                gps_lock = None;
+                last_pps = None;
+                pps_edge = None;
+                health_ts = None;
+                h.idx = next;
+                h.since = Instant::now();
+                let [a, b] = h.plans[next].radio_hz;
+                eprintln!(
+                    "hop {}/{}: radios {a}/{b} Hz (restart took {} ms)",
+                    next + 1,
+                    h.plans.len(),
+                    t0.elapsed().as_millis()
+                );
             }
         }
 
@@ -465,7 +609,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             Ok((req, start, horizon)) => {
                                 let now = c.now_us()?;
-                                match jit.enqueue_within(req, start, now, horizon) {
+                                let mono_ms = started.elapsed().as_millis() as u64;
+                                match submit(&mut jit, &mut air, req, start, now, horizon, mono_ms) {
                                     Ok(()) => {
                                         eprintln!(
                                             "queued tmst={} (+{} ms), queue {}",
@@ -479,7 +624,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         if e == jit::JitError::Collision {
                                             st.coll += 1;
                                         }
-                                        eprintln!("jit: {}", e.gwmp());
+                                        eprintln!("jit: {}", e.reason());
                                         e.gwmp()
                                     }
                                 }
@@ -497,6 +642,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Air-time limits first, then the JIT queue. `mono_ms` is host-monotonic "now".
+fn submit(
+    jit: &mut JitQueue,
+    air: &mut jit::Airtime,
+    req: TxRequest,
+    start_us: Option<u32>,
+    now: u32,
+    horizon: u32,
+    mono_ms: u64,
+) -> Result<(), jit::JitError> {
+    let toa_us = req.time_on_air_us();
+    let ahead_ms = start_us.map_or(0, |t| i64::from(t.wrapping_sub(now) as i32) / 1000);
+    let at_ms = mono_ms.saturating_add_signed(ahead_ms);
+    air.check(at_ms, toa_us)?;
+    jit.enqueue_within(req, start_us, now, horizon)?;
+    air.record(at_ms, toa_us);
+    Ok(())
 }
 
 /// Network errors (ECONNREFUSED from a dead server, ENETUNREACH while the link is
@@ -542,13 +706,14 @@ fn parse_txpk(
     let tx = v.get("txpk").ok_or("COLLISION_PACKET")?;
     let freq = tx.get("freq").and_then(|x| x.as_f64()).ok_or("TX_FREQ")?;
     let freq_hz = (freq * 1_000_000.0).round() as u32;
-    let region = if Region::As923_1.contains(freq_hz) {
+    let region = if Region::As923_1.tx_contains(freq_hz) {
         Region::As923_1
-    } else if Region::Us915.contains(freq_hz) {
+    } else if Region::Us915.tx_contains(freq_hz) {
         Region::Us915
+    } else if Region::Fcc800.tx_contains(freq_hz) {
+        Region::Fcc800
     } else if Region::Fcc800.contains(freq_hz) {
-        // shortcut: licensed 809–817 MHz, no Alliance raster, no SX1250 image-cal row.
-        eprintln!("txpk {freq_hz} Hz is FCC-800 (809–817); SX1250 image cal has no row there");
+        eprintln!("txpk {freq_hz} Hz is the FCC-800 device side (809–817); the gateway transmits 45 MHz higher");
         return Err("TX_FREQ");
     } else if Region::Ism2400.contains(freq_hz) {
         eprintln!("txpk {freq_hz} Hz is ISM2400; SX1250 cannot transmit 2.4 GHz");
@@ -778,6 +943,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.region, Region::Us915);
+        // FCC-800: gateway side is uplink + 45 MHz
+        let (r, _, _) = parse_txpk(
+            r#"{"txpk":{"imme":true,"freq":854.1,"modu":"LORA","datr":"SF7BW125","data":"AQ=="}}"#,
+            &lut,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!((r.region, r.freq_hz), (Region::Fcc800, 854_100_000));
         assert_eq!(
             parse_txpk(
                 r#"{"txpk":{"imme":true,"freq":813.0,"modu":"LORA","datr":"SF7BW125","data":"AQ=="}}"#,
@@ -800,6 +974,64 @@ mod tests {
         assert_eq!(s["time_src"], "host");
         assert_eq!(s["coll"], 2);
         assert!(stat_json("", &Stats::default(), 0.0, None, "pps")["stat"]["temp"].is_null());
+    }
+
+    #[test]
+    fn submit_charges_only_accepted_packets() {
+        let mut jit = JitQueue::default();
+        // 0.01 % of an hour = 360 ms
+        let mut air = jit::Airtime::new(Some(400), Some(0.01));
+        let mk = |sf: u8| {
+            let mut r = TxRequest::as923_1_sf7(vec![0; 12]).unwrap();
+            r.sf = sf;
+            r
+        };
+        // SF12 breaks the dwell limit and is not charged
+        assert_eq!(
+            submit(&mut jit, &mut air, mk(12), Some(1_000_000), 0, jit::MAX_AHEAD_US, 0),
+            Err(jit::JitError::Dwell)
+        );
+        // SF10 fits once; the second one is over budget, not a collision
+        submit(&mut jit, &mut air, mk(10), Some(1_000_000), 0, jit::MAX_AHEAD_US, 0).unwrap();
+        assert_eq!(
+            submit(&mut jit, &mut air, mk(10), Some(3_000_000), 0, jit::MAX_AHEAD_US, 0),
+            Err(jit::JitError::DutyCycle)
+        );
+        assert_eq!(jit.len(), 1);
+        // a late packet is refused by the queue and leaves the budget alone
+        let mut air = jit::Airtime::new(None, Some(0.01));
+        assert_eq!(
+            submit(&mut jit, &mut air, mk(10), Some(5_000), 0, jit::MAX_AHEAD_US, 0),
+            Err(jit::JitError::TooLate)
+        );
+        submit(&mut jit, &mut air, mk(10), Some(3_000_000), 0, jit::MAX_AHEAD_US, 0).unwrap();
+    }
+
+    #[test]
+    fn hop_blocks_from_config() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"region":"US915","subband":0,"hop":{"dwell_s":20,"step_hz":1600000,"steps":8}}"#,
+        )
+        .unwrap();
+        let base = ChannelPlan::preset(Region::parse(cfg.region.as_deref().unwrap()).unwrap(), cfg.subband).unwrap();
+        let plans = hop_plans(&base, Region::Us915, &cfg.hop.unwrap()).unwrap();
+        assert_eq!(plans.len(), 8);
+        assert_eq!(plans[7], ChannelPlan::us915_subband(7).unwrap());
+
+        // AS923-1: the default block and the one 1.6 MHz below
+        let a = ChannelPlan::as923_1_default();
+        let hop = |shift_hz: Vec<i64>| HopConfig { dwell_s: 10, shift_hz, ..Default::default() };
+        let plans = hop_plans(&a, Region::As923_1, &hop(vec![0, -1_600_000])).unwrap();
+        assert_eq!(plans[1].multisf[0].freq_hz, 921_000_000);
+        // a block that leaves 920–925 MHz is refused, although it is inside US915
+        assert!(hop_plans(&a, Region::As923_1, &hop(vec![0, 1_600_000])).is_err());
+        assert!(hop_plans(&a, Region::As923_1, &hop(vec![0])).is_err());
+
+        // FCC-800: five sub-bands, a sixth does not fit
+        let f = ChannelPlan::fcc800_subband(0).unwrap();
+        let steps = |steps: u32| HopConfig { dwell_s: 10, step_hz: 1_600_000, steps, ..Default::default() };
+        assert_eq!(hop_plans(&f, Region::Fcc800, &steps(5)).unwrap().len(), 5);
+        assert!(hop_plans(&f, Region::Fcc800, &steps(6)).is_err());
     }
 
     #[test]

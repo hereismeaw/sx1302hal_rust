@@ -45,12 +45,15 @@ SF, and RSSI matched for both LoRa and FSK.
   the module's 1PPS reaches the SX1302. A valid RMC plus a PPS edge replaces
   the host clock and puts the antenna coordinates in the beacon. Leave
   `class_b` off beside a gateway that already beacons on GPS time.
-- **Fine timestamps** are SX1303-only. This unit is an SX1302.
+- **Fine timestamps** are SX1303-only. The calculation is ported from
+  Semtech and turns on for a RAK5146, but my unit is an SX1302, so it has
+  never run on real hardware.
 - **LBT / spectral scan** through the SX1262 isn't wired up. Its chip select
   shares SPI0 CE0 on the M1, so it needs a device-tree overlay first. Thailand
   doesn't require LBT.
-- **Only AS923-1 is set up end to end.** The plan format works for other
-  regions, but nobody has tested one.
+- **Only AS923-1 is tested end to end.** US915 and FCC-800 plans, hopping
+  and the dwell / duty-cycle limits are in the code and pass their unit
+  tests. None of them has been on the air.
 - **ATECC608** is inspect-only. It didn't answer on this unit, and every
   write or lock path is blocked on purpose.
 
@@ -65,7 +68,6 @@ with this.
 | SX1302 power enable | BCM 18 (high) |
 | SX1302 reset | BCM 17 (active-high pulse) |
 | SX1262 reset | BCM 5 (active-low pulse) |
-| Pairing button | BCM 27 (active high) |
 | Temperature sensor | STTS751, I2C-1 `0x39` |
 | HAT LEDs | SX1302 GPIO0 (Config), GPIO2 (TX), GPIO4 (RX) |
 | **BCM 13** | AD5338R DAC: **never driven** by this code |
@@ -74,9 +76,15 @@ with this.
 
 LoRaWAN 2.4 GHz (`ISM2400`) is recognized: channels 2403 / 2425 / 2479 MHz, DR0–DR7 = SF12–SF5 at 812 kHz. A downlink in that band is answered `TX_FREQ`. The SX1250 on this HAL cannot tune it.
 
-`US915` lists all 72 RP002 channels: 64 uplinks at 902.3–914.9 MHz step 200 kHz, 8 uplinks at 903.0–914.2 MHz step 1.6 MHz, and 8 downlinks at 923.3–927.5 MHz step 600 kHz. The concentrator listens to one sub-band of eight 125 kHz channels plus the matching 500 kHz uplink. `sx1302-cli start --region US915` loads sub-band 2. The daemon accepts a US915 downlink. The default config stays AS923-1.
+`US915` lists all 72 RP002 channels: 64 uplinks at 902.3–914.9 MHz step 200 kHz, 8 uplinks at 903.0–914.2 MHz step 1.6 MHz, and 8 downlinks at 923.3–927.5 MHz step 600 kHz. The concentrator listens to one sub-band of eight 125 kHz channels plus the matching 500 kHz uplink. `sx1302-cli start --region US915` loads sub-band 2; `--subband 0`–`7` picks another. The daemon accepts a US915 downlink. The default config stays AS923-1.
 
-`FCC-800` is the IotaComm FCC Part 90 block at 809.0–817.0 MHz. The channel list is the Part 90 12.5 kHz raster, 809.0125–816.9875 MHz (639 channels). Downlink is 45 MHz higher, 854.0125–861.9875 MHz, which matches the FSK range in the TEKTELIC gateway's FCC exhibit. That exhibit calls the 800 MHz radio FSK, not LoRa. Semtech's SX1250 image calibration has no row for 809 MHz, so a downlink there is answered `TX_FREQ`.
+`FCC-800` is the IotaComm FCC Part 90 block at 809.0–817.0 MHz. The channel list is the Part 90 12.5 kHz raster, 809.0125–816.9875 MHz (639 channels). Downlink is 45 MHz higher, 854.0125–861.9875 MHz, which matches the FSK range in the TEKTELIC gateway's FCC exhibit. That exhibit calls the 800 MHz radio FSK, not LoRa. This project adds its own LoRa plan for that block (it is not a LoRa Alliance or IotaComm plan): 40 uplinks of 125 kHz at 809.1–816.9 MHz step 200 kHz, in five sub-bands of eight, each with one 500 kHz uplink at 809.8 MHz + n × 1.6 MHz. The gateway answers 45 MHz above the uplink, in 854–862 MHz; a downlink inside 809–817 MHz is answered `TX_FREQ`. `sx1302-cli start --region FCC-800 --subband 0`–`4` loads one sub-band. Semtech's `sx1250_calibrate` has no row for 809 MHz, so the image-calibration bytes (`0xCA`, `0xCD`) come from the 4 MHz-step formula in Semtech's `sx126x_driver`. None of this has been on the air.
+
+Treat the FCC-800 plan as a placeholder. I do not know this band, and the channel centres, the 45 MHz pairing for LoRa and the transmit power still need a review by someone who does. Do not transmit with it until that has happened.
+
+The daemon config takes `"region"` and `"subband"` in place of a full `"plan"`. `"hop"` makes one concentrator listen to several blocks in turn, for example all eight US915 sub-bands: `"region": "US915", "subband": 0, "hop": {"dwell_s": 20, "step_hz": 1600000, "steps": 8}`. AS923-1 has room for two blocks in 920–925 MHz: `"hop": {"dwell_s": 20, "shift_hz": [0, -1600000]}`. Each hop is a GPIO reset and a full start, and uplinks on the other blocks are missed while the gateway sits on one.
+
+`"dwell_ms"` and `"duty_cycle_percent"` (or `--dwell-ms` / `--duty-cycle-percent`) limit transmit air time. Both are off when absent or 0.
 
 The GWMP `stat` object adds `temp` (STTS751, degrees C), `time_src` (`pps` or `host`), and `coll` (downlinks dropped because the transmit queue overlapped). A RAK5146 turns on SX1303 fine timestamp. Semtech's AGC v10 image is the firmware for both the SX1302 and the SX1303 when the front-end is an SX1250.
 
@@ -86,6 +94,53 @@ Two things that cost me time:
   still decodes, but about 40 dB deaf.
 - The old hard-coded TX power sat above the top of Semtech's gain table. That
   caused CRC errors at short range. The gain table fixed it.
+
+## Compared with Semtech's C HAL
+
+Semtech's [`sx1302_hal`](https://github.com/Lora-net/sx1302_hal) (`libloragw`
+plus `lora_pkt_fwd`) is the reference this code was ported from, and it covers
+far more hardware. This table is against v2.1.0.
+
+| | Semtech `sx1302_hal` (C) | This repo (Rust) |
+|---|---|---|
+| Language | C library, C packet forwarder | Rust, no C and no FFI at run time |
+| Host link | SPI, and USB through the STM32 on USB modules | SPI (`spidev`) only |
+| Radios | SX1250, SX1255, SX1257 | SX1250 only |
+| Boards | Semtech reference designs, set in `global_conf.json` | SenseCAP M1 (tested); RAK2287 and RAK5146 SPI reset paths (not booted) |
+| Regions | Whatever the radios and the config allow; example configs for EU868, US915, AS923, CN490 and more | AS923-1 tested on air. US915 in code. FCC-800 provisional (see above) |
+| Config | `global_conf.json` | Its own smaller JSON; a `global_conf.json` will not load |
+| RX: 8 multi-SF, LoRa service, FSK | Yes | Yes, same register setup |
+| TX: LoRa and FSK, immediate or timestamped | Yes, on either radio chain | Yes, chain A only |
+| TX power table | `tx_gain_lut` | Same table and selection rule |
+| RX timestamp correction, RSSI temperature compensation | Yes | Ported, same formulas |
+| Network protocol | Semtech UDP (GWMP) | Semtech UDP (GWMP) |
+| Downlink queue | JIT queue | JIT queue with the same error codes |
+| Class B beacon | Yes, GPS-timed | AS923-1 beacon in code, never transmitted (no GPS on my unit) |
+| GPS | u-blox UBX and NMEA, time sync, crystal error correction | NMEA RMC plus the PPS latch. No UBX, no crystal correction |
+| Fine timestamp (SX1303) | Yes | Ported, unit-tested, never run on an SX1303 |
+| LBT and spectral scan (SX1261) | Yes | No |
+| Full duplex (CN490 reference design) | Yes | No |
+| Dwell-time and duty-cycle limits on TX | No | Optional, off by default |
+| Hopping one concentrator over several channel blocks | No | Optional (`"hop"`) |
+| Setting the host clock and RTC from GPS | No | Yes, when a GPS port is configured |
+| Service supervision | Left to the integrator | systemd unit with a watchdog and a chip health check |
+| Test utilities | `test_loragw_*`, `util_chip_id`, `util_net_downlink`, `util_spectral_scan` | `sx1302-cli`, a fake network server, two T-Beam node firmwares |
+
+What I measured with both on the same SenseCAP M1, same channel plan and the
+same T-Beam test node:
+
+- Downlink start times agree within 0.01 ms for SF7–SF12, BW250 and FSK.
+- RSSI is the same for LoRa and for FSK.
+- `lora_pkt_fwd` also forwards weak copies of a frame heard on neighbouring
+  channels. This daemon drops those duplicates.
+- The Rust daemon sat at about 2.6 MB of resident memory. I did not measure
+  `lora_pkt_fwd`, so that is not a comparison.
+
+When to use which: if your gateway is a Semtech reference design, a USB
+module, anything with SX1255/SX1257 radios, or needs LBT, use the C HAL. It
+is the tested and supported one. This repo is for people who want a small
+Rust code base on an SX1302 + SX1250 SPI board and are ready to check it on
+their own hardware.
 
 ## Building
 
@@ -143,9 +198,6 @@ The daemon holds the SPI bus. Stop the service before using `sx1302-cli`.
 - [`tools/semtech-ref`](tools/semtech-ref): how to build and run Semtech's
   `lora_pkt_fwd` on the same board for an A/B comparison.
 
-[`docs/HANDOVER.md`](docs/HANDOVER.md) has the detailed notes and the
-measurements behind the claims above.
-
 ## Layout
 
 | Crate | What's in it |
@@ -156,7 +208,7 @@ measurements behind the claims above.
 | `sx1302-radio` | SX1250 commands |
 | `sx1302-firmware` | AGC/ARB firmware blobs |
 | `sensecap-board` | M1 GPIO reset and the STTS751 sensor |
-| `sx126x-radio`, `sensecap-*` | Aux radio, button, LED and secure-element bits |
+| `sx126x-radio`, `sensecap-*` | Aux radio, LED and secure-element bits |
 | `apps/` | `sx1302-cli`, `sx1302-daemon`, `sx1302-bench` |
 
 After bumping the Semtech version, regenerate the register table with

@@ -11,7 +11,6 @@ members = [
     "crates/sx126x-radio",
     "crates/sensecap-board",
     "crates/sensecap-secure-element",
-    "crates/sensecap-button",
     "crates/sensecap-led",
     "crates/sx1302-testkit",
     "apps/sx1302-cli",
@@ -37,7 +36,6 @@ sx1302-hal = { path = "crates/sx1302-hal" }
 sx126x-radio = { path = "crates/sx126x-radio" }
 sensecap-board = { path = "crates/sensecap-board" }
 sensecap-secure-element = { path = "crates/sensecap-secure-element" }
-sensecap-button = { path = "crates/sensecap-button" }
 sensecap-led = { path = "crates/sensecap-led" }
 sx1302-testkit = { path = "crates/sx1302-testkit" }
 thiserror = "2"

@@ -222,13 +222,83 @@ impl ChannelPlan {
         })
     }
 
+    /// One of the five FCC-800 sub-bands (`0..5`) of the project plan in
+    /// `sx1302_core` (`FCC800_LORA_*`): eight 125 kHz uplinks from
+    /// 809.1 MHz + index × 1.6 MHz plus the 500 kHz uplink of that sub-band.
+    /// Downlinks go out 45 MHz higher and are not part of the RX plan.
+    pub fn fcc800_subband(index: u8) -> Option<Self> {
+        if index >= sx1302_core::FCC800_LORA_SUBBANDS {
+            return None;
+        }
+        let base = sx1302_core::fcc800_lora_uplink_125_hz(index * 8)?;
+        let mut multisf = Vec::with_capacity(8);
+        for i in 0..8u32 {
+            multisf.push(MultiSfChan { radio: u8::from(i >= 4), freq_hz: base + i * 200_000 });
+        }
+        Some(Self {
+            radio_hz: [base + 300_000, base + 1_100_000],
+            single_input_mode: default_single_input(),
+            rssi_offset: default_rssi_offset(),
+            rssi_tcomp: [RssiTcomp::default(); 2],
+            multisf,
+            lora_std: Some(LoraStdChan {
+                radio: 0,
+                freq_hz: sx1302_core::fcc800_lora_uplink_500_hz(index)?,
+                sf: 8,
+                bw_hz: 500_000,
+            }),
+            fsk: None,
+        })
+    }
+
+    /// Preset plan for a region. `subband` is 0-based: US915 `0..8` (default 1,
+    /// TTN FSB2), FCC-800 `0..5` (default 0). AS923-1 has one preset.
+    pub fn preset(region: Region, subband: Option<u8>) -> Result<Self> {
+        let bad = |n: u8, max: u8| HalError::Other(format!("{region} sub-band {n} (0..{max})"));
+        match region {
+            Region::As923_1 => Ok(Self::as923_1_default()),
+            Region::Us915 => {
+                let n = subband.unwrap_or(1);
+                Self::us915_subband(n).ok_or_else(|| bad(n, 8))
+            }
+            Region::Fcc800 => {
+                let n = subband.unwrap_or(0);
+                Self::fcc800_subband(n).ok_or_else(|| bad(n, sx1302_core::FCC800_LORA_SUBBANDS))
+            }
+            other => Err(HalError::Other(format!("no preset channel plan for {other}"))),
+        }
+    }
+
+    /// The same plan moved by `delta_hz` (radios and every channel). Used to hop
+    /// between blocks that share one IF layout, e.g. US915 sub-bands (1.6 MHz apart).
+    pub fn shifted(&self, delta_hz: i64) -> Result<Self> {
+        let mv = |f: u32| -> Result<u32> {
+            u32::try_from(i64::from(f) + delta_hz)
+                .map_err(|_| HalError::Other(format!("channel plan: {f} Hz shifted by {delta_hz} Hz")))
+        };
+        let mut p = self.clone();
+        for r in &mut p.radio_hz {
+            *r = mv(*r)?;
+        }
+        for c in &mut p.multisf {
+            c.freq_hz = mv(c.freq_hz)?;
+        }
+        if let Some(s) = &mut p.lora_std {
+            s.freq_hz = mv(s.freq_hz)?;
+        }
+        if let Some(f) = &mut p.fsk {
+            f.freq_hz = mv(f.freq_hz)?;
+        }
+        Ok(p)
+    }
+
     /// US915 sub-band 2 (RP002 channels 8–15 + 500 kHz uplink 65).
     pub fn us915_sb2() -> Self {
         Self::us915_subband(1).expect("sub-band 1")
     }
 
-    /// Band both radios sit in, then [`Self::validate`]. FCC-800 and ISM2400
-    /// are named so a plan aimed there fails with the reason, not a generic miss.
+    /// Band both radios sit in, then [`Self::validate`]. ISM2400 is named so a
+    /// plan aimed there fails with the reason, not a generic miss.
     pub fn band(&self) -> Result<Region> {
         let inside = |r: Region| self.radio_hz.iter().all(|f| r.contains(*f));
         let region = if inside(Region::As923_1) {
@@ -238,9 +308,7 @@ impl ChannelPlan {
         } else if inside(Region::Eu868) {
             Region::Eu868
         } else if inside(Region::Fcc800) {
-            return Err(HalError::Other(
-                "FCC-800 is 809–817 MHz (IotaComm Part 90). No LoRa Alliance channel plan, and SX1250 CALIBRATE_IMAGE has no row for that window".into(),
-            ));
+            Region::Fcc800
         } else if inside(Region::Ism2400) {
             return Err(HalError::Other(
                 "ISM2400 2.4 GHz is SX1280 LoRa at 812 kHz; this SX1250 frontend cannot tune it".into(),
@@ -358,6 +426,50 @@ mod tests {
             ChannelPlan::us915_subband(i).unwrap().validate(Region::Us915).unwrap();
         }
         assert!(ChannelPlan::us915_subband(8).is_none());
+    }
+
+    #[test]
+    fn fcc800_plan_and_presets() {
+        for i in 0..5 {
+            let p = ChannelPlan::fcc800_subband(i).unwrap();
+            assert_eq!(p.band().unwrap(), Region::Fcc800);
+            assert_eq!(p.multisf.len(), 8);
+        }
+        assert!(ChannelPlan::fcc800_subband(5).is_none());
+        let first = ChannelPlan::fcc800_subband(0).unwrap();
+        assert_eq!(first.multisf[0].freq_hz, 809_100_000);
+        assert_eq!(first.lora_std.unwrap().freq_hz, 809_800_000);
+        let last = ChannelPlan::fcc800_subband(4).unwrap();
+        assert_eq!(last.multisf[7].freq_hz, 816_900_000);
+        assert_eq!(last.lora_std.unwrap().freq_hz, 816_200_000);
+
+        assert_eq!(ChannelPlan::preset(Region::Us915, None).unwrap(), ChannelPlan::us915_sb2());
+        assert_eq!(ChannelPlan::preset(Region::Fcc800, Some(4)).unwrap(), last);
+        assert_eq!(ChannelPlan::preset(Region::As923_1, None).unwrap(), ChannelPlan::as923_1_default());
+        assert!(ChannelPlan::preset(Region::Us915, Some(8)).is_err());
+        assert!(ChannelPlan::preset(Region::Eu868, None).is_err());
+    }
+
+    #[test]
+    fn shifted_plans_are_the_other_subbands() {
+        let sb0 = ChannelPlan::us915_subband(0).unwrap();
+        for i in 0..8u8 {
+            let p = sb0.shifted(i64::from(i) * 1_600_000).unwrap();
+            assert_eq!(p, ChannelPlan::us915_subband(i).unwrap());
+        }
+        let f0 = ChannelPlan::fcc800_subband(0).unwrap();
+        assert_eq!(f0.shifted(4 * 1_600_000).unwrap(), ChannelPlan::fcc800_subband(4).unwrap());
+        assert!(f0.shifted(5 * 1_600_000).unwrap().band().is_err());
+        // AS923-1, 920–925 MHz: the default block and the one 1.6 MHz below fit.
+        // 920–925 lies inside the US915 window, so `band()` would call a block
+        // outside it US915: a hop has to be validated against its own region.
+        let a = ChannelPlan::as923_1_default();
+        let low = a.shifted(-1_600_000).unwrap();
+        assert_eq!(low.band().unwrap(), Region::As923_1);
+        assert_eq!(low.multisf[0].freq_hz, 921_000_000);
+        assert!(a.shifted(1_600_000).unwrap().validate(Region::As923_1).is_err());
+        assert!(a.shifted(-3_200_000).unwrap().validate(Region::As923_1).is_err());
+        assert!(a.shifted(-5_000_000_000).is_err());
     }
 
     #[test]

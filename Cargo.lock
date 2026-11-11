@@ -222,15 +222,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sensecap-button"
-version = "0.1.0"
-dependencies = [
- "gpiocdev",
- "serde",
- "sx1302-core",
-]
-
-[[package]]
 name = "sensecap-led"
 version = "0.1.0"
 dependencies = [
@@ -325,7 +316,6 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "sensecap-board",
- "sensecap-button",
  "sensecap-led",
  "sensecap-secure-element",
  "serde_json",

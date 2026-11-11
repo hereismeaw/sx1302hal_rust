@@ -15,4 +15,3 @@ sx1302-firmware.workspace = true
 sensecap-secure-element.workspace = true
 sx126x-radio.workspace = true
 sensecap-led.workspace = true
-sensecap-button.workspace = true

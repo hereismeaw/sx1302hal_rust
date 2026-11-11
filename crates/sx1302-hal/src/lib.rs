@@ -25,7 +25,8 @@ pub use classb::{
 pub use gps::{parse_rmc, Rmc};
 pub use lorawan::{MType, MacRev, PhyHdr};
 pub use pkt::{
-    legacy_timestamp_correction_us, parse_rx_buffer, time_on_air_us, FskTx, RxDump, RxModulation,
+    legacy_timestamp_correction_us, parse_rx_buffer, parse_rx_buffer_mode,
+    precision_timestamp_correction_us, time_on_air_us, FskTx, RxDump, RxModulation,
     RxPacket, TxGain, TxGainLut, TxRequest, TxTrigger, RSSI_OFFSET_SX1250,
 };
 pub use plan::{
@@ -42,6 +43,10 @@ pub struct Concentrator {
     ts: std::sync::Mutex<timestamp::TsWrap>,
     /// Board temperature (°C) for RSSI compensation; `None` = no compensation.
     temperature: std::sync::Mutex<Option<f32>>,
+    /// SX1303 precision timestamp requested (`lgw_conf_ftime_s.enable`). Read by `start`.
+    fine: std::sync::atomic::AtomicBool,
+    /// Last PPS latches (raw 32 MHz), reference for the fine timestamp.
+    pps_hist: std::sync::Mutex<timestamp::PpsHistory>,
 }
 
 impl Concentrator {
@@ -68,6 +73,8 @@ impl Concentrator {
             plan: std::sync::Mutex::new(ChannelPlan::as923_1_default()),
             ts: std::sync::Mutex::new(timestamp::TsWrap::default()),
             temperature: std::sync::Mutex::new(None),
+            fine: std::sync::atomic::AtomicBool::new(false),
+            pps_hist: std::sync::Mutex::new(timestamp::PpsHistory::default()),
         })
     }
 
@@ -262,7 +269,7 @@ impl Concentrator {
     /// Bring radios up at the region default frequency, then SX1250 SET_TX + PA_EN.
     pub fn start_tx(&self, region: Region, freq_hz: Option<u32>) -> Result<DetectReport> {
         let freq = freq_hz.unwrap_or(region.default_tx_hz());
-        if !region.contains(freq) {
+        if !region.tx_contains(freq) {
             return Err(HalError::FrequencyOutOfBand {
                 freq_hz: freq,
                 region,

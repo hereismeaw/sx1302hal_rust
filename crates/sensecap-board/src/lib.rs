@@ -63,7 +63,6 @@ pub fn wm1302_hat_candidate_pins() -> Vec<BoardPin> {
         pin("SX1262_DIO2", 24, ElectricalFunction::Dio, Polarity::Unknown, Direction::Input, "input", 0, 0, VerificationStatus::CandidateFromDocs, ""),
         pin("GPS_RESET", 25, ElectricalFunction::Reset, Polarity::Unknown, Direction::Unconfigured, "unverified", 0, 0, VerificationStatus::CandidateFromDocs, "Standard Pi HAT GPS; SenseCAP M1 GPS presence unknown"),
         pin("AD5338R_RESET", 13, ElectricalFunction::Reset, Polarity::Unknown, Direction::Unconfigured, "unverified", 0, 0, VerificationStatus::ConflictUnverified, "Present in Semtech reset_lgw.sh; absent from Seeed HAT table. CN490 full-duplex reference. Do not drive."),
-        pin("PAIRING_BUTTON", 255, ElectricalFunction::Unknown, Polarity::Unknown, Direction::Input, "unverified", 0, 0, VerificationStatus::NotPresent, "Clockwork Bird: GPIO unknown; probe unused inputs only"),
         pin("INDICATOR_LED", 22, ElectricalFunction::Unknown, Polarity::ActiveHigh, Direction::Output, "low", 0, 0, VerificationStatus::CandidateFromDocs, "Clockwork Bird M1 v1.1 User LED = GPIO22"),
     ]
 }

@@ -155,12 +155,12 @@ impl Concentrator {
         port.rmw(SX1302_REG_COMMON_BASE_ADDR + 2, 3, 1, 0)?;
         port.rmw(RX_TOP + 135, 1, 1, 0)?;
         port.write_u8(RX_TOP + 192, 0x00)?;
-        port.rmw(RX_TOP + 192, 2, 1, 1)?; // LEGACY_TIMESTAMP
+        let fine = self.timestamp_mode(&port, &mut notes)?;
         Self::config_gpio(&port)?;
         let common_gen = Self::common_gen(plan);
         port.write_u8(COMMON_GEN, common_gen)?;
         notes.push(format!(
-            "{} multi-SF chains{}{} + legacy TS before AGC",
+            "{} multi-SF chains{}{} + {} TS before AGC",
             plan.multisf.len(),
             plan.lora_std
                 .map(|s| format!(" + LoRa std {} Hz SF{} BW{}k", s.freq_hz, s.sf, s.bw_hz / 1000))
@@ -168,6 +168,7 @@ impl Concentrator {
             plan.fsk
                 .map(|f| format!(" + FSK {} Hz {} b/s", f.freq_hz, f.datarate))
                 .unwrap_or_default(),
+            if fine { "precision" } else { "legacy" },
         ));
 
         let agc = sx1302_firmware::AGC_FW_SX1250;
@@ -182,7 +183,7 @@ impl Concentrator {
         notes.push(format!(
             "AGC start handshake done (fw version {FW_VERSION_AGC_SX1250})"
         ));
-        self.arb_start(&port)?;
+        self.arb_start(&port, fine)?;
         notes.push(format!("ARB start handshake done (fw version {FW_VERSION_ARB})"));
         // Re-arm SX1250 RX after AGC (host SPI), single-input, LNA on.
         port.rmw(COMMON_CTRL0, 3, 1, 1)?;
@@ -353,7 +354,7 @@ impl Concentrator {
         }
     }
 
-    fn arb_start(&self, port: &ConcentratorPort<'_>) -> Result<()> {
+    fn arb_start(&self, port: &ConcentratorPort<'_>, fine: bool) -> Result<()> {
         Self::wait_arb(port, 0x01)?;
         let ver = port.read_u8(ARB + 13)?; // DEBUG_STS_0 = version
         if ver != FW_VERSION_ARB {
@@ -362,7 +363,9 @@ impl Concentrator {
             )));
         }
         port.write_u8(ARB + 9, 7)?; // stats SF7
-        port.write_u8(ARB + 12, 0x00)?; // dual demod off
+        // Dual demodulation (best timestamp + best demodulation), one bit per SF5..SF12.
+        // 0xFF = LGW_FTIME_MODE_ALL_SF, the Semtech default when fine timestamp is on.
+        port.write_u8(ARB + 12, if fine { 0xFF } else { 0x00 })?;
         port.write_u8(ARB + 11, 3)?; // double-detect threshold
         port.write_u8(ARB + 10, 1)?; // resume
         Self::wait_arb(port, 0x00)?;

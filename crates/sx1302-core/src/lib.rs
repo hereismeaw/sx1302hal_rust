@@ -76,8 +76,9 @@ pub enum Region {
     #[serde(rename = "ISM2400")]
     Ism2400,
     /// IotaComm FCC Part 90 licensed block, 809.0–817.0 MHz (announced 2026-01-29).
-    /// No LoRa Alliance channel raster. SX1250 image cal has no row here
-    /// (Semtech's nearest row is 779–787 MHz).
+    /// No LoRa Alliance channel raster: the LoRa channels are this project's own
+    /// plan (`FCC800_LORA_*`). Devices transmit in 809–817 MHz, the gateway
+    /// answers 45 MHz higher, in 854–862 MHz.
     #[serde(rename = "FCC-800")]
     Fcc800,
 }
@@ -107,6 +108,35 @@ pub fn fcc800_downlink_hz(index: u16) -> Option<u32> {
     fcc800_uplink_hz(index).map(|hz| hz + FCC800_DUPLEX_HZ)
 }
 
+/// Project LoRa plan for the 809–817 MHz block (operator decision 2026-11-11, not
+/// a LoRa Alliance or IotaComm plan). Same shape as US915: 125 kHz uplinks every
+/// 200 kHz, grouped in sub-bands of eight, each with one 500 kHz uplink.
+pub const FCC800_LORA_125_FIRST_HZ: u32 = 809_100_000;
+pub const FCC800_LORA_125_STEP_HZ: u32 = 200_000;
+pub const FCC800_LORA_125_COUNT: u8 = 40;
+pub const FCC800_LORA_500_FIRST_HZ: u32 = 809_800_000;
+pub const FCC800_LORA_SUBBAND_HZ: u32 = 1_600_000;
+pub const FCC800_LORA_SUBBANDS: u8 = 5;
+
+/// 125 kHz uplink `0..40`: 809.1 MHz + n × 200 kHz (809.1–816.9 MHz).
+pub fn fcc800_lora_uplink_125_hz(ch: u8) -> Option<u32> {
+    (ch < FCC800_LORA_125_COUNT)
+        .then(|| FCC800_LORA_125_FIRST_HZ + u32::from(ch) * FCC800_LORA_125_STEP_HZ)
+}
+
+/// 500 kHz uplink `0..5`: 809.8 MHz + n × 1.6 MHz (809.8–816.2 MHz).
+pub fn fcc800_lora_uplink_500_hz(ch: u8) -> Option<u32> {
+    (ch < FCC800_LORA_SUBBANDS)
+        .then(|| FCC800_LORA_500_FIRST_HZ + u32::from(ch) * FCC800_LORA_SUBBAND_HZ)
+}
+
+/// Gateway downlink for an uplink frequency: + 45 MHz (854–862 MHz).
+pub fn fcc800_lora_downlink_hz(uplink_hz: u32) -> Option<u32> {
+    Region::Fcc800
+        .contains(uplink_hz)
+        .then(|| uplink_hz + FCC800_DUPLEX_HZ)
+}
+
 /// DR0 = SF12 … DR7 = SF5, all at 812 kHz, coding rate 4/8 long interleaver.
 pub fn ism2400_sf(dr: u8) -> Option<u8> {
     match dr {
@@ -133,12 +163,26 @@ impl Region {
             Self::Us915 => 903_900_000,
             Self::As923_1 => 923_200_000,
             Self::Ism2400 => ISM2400_CHANNELS_HZ[0],
-            // No published channel. 0 fails `contains`, so TX must pass an explicit Hz.
-            Self::Fcc800 => 0,
+            // Downlink of project channel 0 (809.1 MHz + 45 MHz).
+            Self::Fcc800 => FCC800_LORA_125_FIRST_HZ + FCC800_DUPLEX_HZ,
         }
     }
 
-    /// Inclusive RF window used for TX frequency checks.
+    /// Inclusive window the gateway may transmit in. Same as [`Self::band_hz`]
+    /// except FCC-800, where the gateway side is 45 MHz above the device side.
+    pub fn tx_band_hz(self) -> (u32, u32) {
+        match self {
+            Self::Fcc800 => (809_000_000 + FCC800_DUPLEX_HZ, 817_000_000 + FCC800_DUPLEX_HZ),
+            other => other.band_hz(),
+        }
+    }
+
+    pub fn tx_contains(self, freq_hz: u32) -> bool {
+        let (lo, hi) = self.tx_band_hz();
+        (lo..=hi).contains(&freq_hz)
+    }
+
+    /// Inclusive RF window the gateway receives in (device uplinks).
     pub fn band_hz(self) -> (u32, u32) {
         match self {
             Self::Eu868 => (863_000_000, 870_000_000),
@@ -217,7 +261,18 @@ mod tests {
         assert_eq!(fcc, Region::Fcc800);
         assert!(fcc.contains(809_000_000) && fcc.contains(817_000_000));
         assert!(!fcc.contains(902_000_000));
-        assert_eq!(fcc.default_tx_hz(), 0);
+        assert_eq!(fcc.default_tx_hz(), 854_100_000);
+        assert!(fcc.tx_contains(854_100_000) && fcc.tx_contains(862_000_000));
+        assert!(!fcc.tx_contains(809_100_000), "809–817 is the device side");
+        assert!(!Region::Eu868.tx_contains(862_000_000));
+        assert_eq!(Region::As923_1.tx_band_hz(), Region::As923_1.band_hz());
+        assert_eq!(fcc800_lora_uplink_125_hz(0), Some(809_100_000));
+        assert_eq!(fcc800_lora_uplink_125_hz(39), Some(816_900_000));
+        assert!(fcc800_lora_uplink_125_hz(40).is_none());
+        assert_eq!(fcc800_lora_uplink_500_hz(4), Some(816_200_000));
+        assert!(fcc800_lora_uplink_500_hz(5).is_none());
+        assert_eq!(fcc800_lora_downlink_hz(816_900_000), Some(861_900_000));
+        assert!(fcc800_lora_downlink_hz(902_300_000).is_none());
         assert!(Region::Us915.contains(903_900_000));
         assert_eq!(fcc800_uplink_hz(0), Some(809_012_500));
         assert_eq!(fcc800_uplink_hz(638), Some(816_987_500));

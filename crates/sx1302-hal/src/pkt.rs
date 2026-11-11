@@ -75,6 +75,15 @@ pub struct RxPacket {
     pub freq_offset: i32,
     pub payload_hex: String,
     pub payload: Vec<u8>,
+    /// Demodulated with the timing set meant for fine timestamping (SX1303 dual demod).
+    #[serde(default)]
+    pub timing_set: bool,
+    /// Fine-timestamp metrics from the FIFO, two entries per metric.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ts_metrics: Vec<i8>,
+    /// GWMP `ftime`: ns since the last PPS edge (SX1303, PPS wired, CRC OK).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ftime_ns: Option<u32>,
 }
 
 /// GWMP `txpk` FSK parameters.
@@ -283,6 +292,32 @@ pub fn time_on_air_us(
     (t_pre + n_payload * t_sym).round() as u32
 }
 
+/// `precision_timestamp_correction` (`loragw_sx1302_timestamp.c`): µs to add to the
+/// end-of-header latch used in fine-timestamp mode. Payload duration from Semtech
+/// `lora_packet_time_on_air`, minus the filtering delay. Explicit header only.
+pub fn precision_timestamp_correction_us(bw: u8, sf: u8, cr: u8, crc_en: bool, payload_length: u8) -> i32 {
+    let bw_pow: u32 = match bw {
+        0x04 => 1,
+        0x05 => 2,
+        0x06 => 4,
+        _ => return 0,
+    };
+    if !(5..=12).contains(&sf) || !(1..=4).contains(&cr) {
+        return 0;
+    }
+    let sf_i = i32::from(sf);
+    let t_symbol_us = (1i32 << sf) * 8 / bw_pow as i32;
+    let de = i32::from(sf >= 11);
+    let bits = 8 * i32::from(payload_length) + if crc_en { 16 } else { 0 } - 4 * sf_i
+        + if sf >= 7 { 8 } else { 0 }
+        + 20;
+    let nb_symbols_payload =
+        (f64::from(bits.max(0)) / f64::from(4 * (sf_i - 2 * de))).ceil() as i32 * (i32::from(cr) + 4);
+    let filtering_delay = 16_000_000 / bw_pow + 2_031_250;
+    // C: int32 -= double, so the result truncates toward zero.
+    (f64::from(nb_symbols_payload * t_symbol_us) - (f64::from(filtering_delay) + 500e3) / 1e6) as i32
+}
+
 /// `legacy_timestamp_correction` (`loragw_sx1302_timestamp.c`): µs to add to the
 /// legacy end-of-packet latch to compensate modem decode latency (always <= 0).
 /// `dft_peak_auto` matches `RX_DFT_PEAK_MODE_AUTO`.
@@ -363,6 +398,19 @@ fn fsk_rssi_linearize(raw: f32) -> f32 {
 /// Parse Semtech RX FIFO bytes into packets. `count_us` is the unexpanded 27-bit
 /// value plus the decode-latency correction. Public for tests.
 pub fn parse_rx_buffer(buf: &[u8], chains: &ChainMap) -> Vec<RxPacket> {
+    parse_rx_buffer_mode(buf, chains, false)
+}
+
+/// [`parse_rx_buffer`] with the timestamp mode: `fine` = SX1303 precision timestamp
+/// (LoRa latch at end of header, `precision_timestamp_correction`).
+pub fn parse_rx_buffer_mode(buf: &[u8], chains: &ChainMap, fine: bool) -> Vec<RxPacket> {
+    let lora_corr = |bw: u8, sf: u8, cr: u8, crc_en: bool, size: u8| {
+        if fine {
+            precision_timestamp_correction_us(bw, sf, cr, crc_en, size)
+        } else {
+            legacy_timestamp_correction_us(bw, sf, cr, crc_en, size, true)
+        }
+    };
     let mut out = Vec::new();
     let mut idx = 0usize;
     while idx + 2 <= buf.len() {
@@ -406,6 +454,8 @@ pub fn parse_rx_buffer(buf: &[u8], chains: &ChainMap) -> Vec<RxPacket> {
         let crc_err = pkt[t + 9] & 1 != 0;
         let sync_err = (pkt[t + 9] >> 2) & 1 != 0;
         let hdr_err = (pkt[t + 9] >> 3) & 1 != 0;
+        let timing_set = (pkt[t + 9] >> 4) & 1 != 0;
+        let ts_metrics: Vec<i8> = pkt[t + 22..t + 22 + 2 * num_ts].iter().map(|b| *b as i8).collect();
         let snr = pkt[t + 10] as i8;
         let rssi_chan = pkt[t + 11];
         let rssi_sig = pkt[t + 12];
@@ -428,7 +478,7 @@ pub fn parse_rx_buffer(buf: &[u8], chains: &ChainMap) -> Vec<RxPacket> {
                 RxModulation::Lora,
                 BW_125KHZ,
                 0,
-                legacy_timestamp_correction_us(BW_125KHZ, sf, cr, crc_en, size as u8, true),
+                lora_corr(BW_125KHZ, sf, cr, crc_en, size as u8),
                 f32::from(rssi_chan) + RSSI_OFFSET_SX1250,
                 f32::from(rssi_sig) + RSSI_OFFSET_SX1250,
                 0.119_209_29f32,
@@ -438,7 +488,7 @@ pub fn parse_rx_buffer(buf: &[u8], chains: &ChainMap) -> Vec<RxPacket> {
                 RxModulation::Lora,
                 bw,
                 0,
-                legacy_timestamp_correction_us(bw, sf, cr, crc_en, size as u8, true),
+                lora_corr(bw, sf, cr, crc_en, size as u8),
                 f32::from(rssi_chan) + RSSI_OFFSET_SX1250,
                 f32::from(rssi_sig) + RSSI_OFFSET_SX1250,
                 match bw {
@@ -480,6 +530,9 @@ pub fn parse_rx_buffer(buf: &[u8], chains: &ChainMap) -> Vec<RxPacket> {
             freq_offset: (foff as f32 * foff_lsb) as i32,
             payload_hex: payload.iter().map(|b| format!("{b:02x}")).collect(),
             payload,
+            timing_set,
+            ts_metrics,
+            ftime_ns: None,
         });
     }
     out
@@ -541,6 +594,9 @@ impl RxPacket {
                     ((f64::from(self.snr) * 10.0).round() / 10.0).into(),
                 );
                 o.insert("foff".into(), self.freq_offset.into());
+                if let Some(ns) = self.ftime_ns {
+                    o.insert("ftime".into(), ns.into());
+                }
             }
         }
         v
@@ -552,6 +608,12 @@ impl Concentrator {
         let port = self.bus.sx1302();
         // Refresh the wrap tracker before reading packets latched just before now.
         self.now_us()?;
+        // Fine timestamp: keep the PPS history current on every poll (`timestamp_counter_get`).
+        let fine = self.fine_timestamp();
+        let pps_reg = if fine { Some(self.pps_raw_32mhz()?) } else { None };
+        if let Some(reg) = pps_reg {
+            self.pps_history_save(reg);
+        }
         let rssi_bb_a = port.read_u8(0x5705).ok();
         let rssi_dec_a = port.read_u8(0x5704).ok();
         let n1 = rx_nb(&port)?;
@@ -572,6 +634,7 @@ impl Concentrator {
         let mut buf = vec![0u8; n];
         port.read_burst(RX_RAM, &mut buf)?;
         let temperature = *self.temperature.lock().unwrap();
+        let radio_hz = self.plan.lock().unwrap().radio_hz;
         let (chains, multisf_radio, rssi_adj) = {
             let plan = self.plan.lock().unwrap();
             let radios: Vec<u8> = plan.multisf.iter().map(|c| c.radio).collect();
@@ -584,7 +647,7 @@ impl Concentrator {
             };
             (plan.chain_map(), (radios, std_radio, fsk_radio), [adj(0), adj(1)])
         };
-        let packets = parse_rx_buffer(&buf, &chains)
+        let packets = parse_rx_buffer_mode(&buf, &chains, fine)
             .into_iter()
             .filter(|p| p.size > 0)
             .map(|mut p| {
@@ -598,6 +661,19 @@ impl Concentrator {
                 p.rssi_chan += a;
                 if p.modulation == RxModulation::Lora {
                     p.rssi_sig += a;
+                }
+                if let Some(reg) = pps_reg {
+                    if p.modulation == RxModulation::Lora && p.stat == 1 && p.timing_set && !p.ts_metrics.is_empty() {
+                        let if_hz = p.freq_hz as i64 as i32 - radio_hz[usize::from(p.rf_chain & 1)] as i32;
+                        p.ftime_ns = self.ftime_ns(
+                            reg,
+                            &p.ts_metrics,
+                            p.ts_raw,
+                            p.sf,
+                            if_hz,
+                            pkt_freq_error(p.freq_hz, p.freq_offset, if_hz),
+                        );
+                    }
                 }
                 p
             })
@@ -616,6 +692,15 @@ impl Concentrator {
     pub fn rx_packets(&self) -> Result<Vec<RxPacket>> {
         Ok(self.rx_poll()?.packets)
     }
+}
+
+/// Relative frequency error of a packet (`sx1302_parse`). The IF register is
+/// 15625/32 Hz per step, so the channel sits a little off its nominal IF; Semtech
+/// adds that remainder to the measured offset before computing the fine timestamp.
+fn pkt_freq_error(freq_hz: u32, freq_offset_hz: i32, if_freq_hz: i32) -> f64 {
+    let if_freq_error = if_freq_hz - (if_freq_hz * 32 / 15625) * 15625 / 32;
+    let offset = f64::from(freq_offset_hz + if_freq_error);
+    (f64::from(freq_hz) + offset) / f64::from(freq_hz) - 1.0
 }
 
 fn rx_nb(port: &ConcentratorPort<'_>) -> Result<u16> {
@@ -642,17 +727,12 @@ impl Concentrator {
 
     /// Program TX_TOP_A and arm it (immediate or timestamped). Never blocks.
     pub fn send(&self, req: &TxRequest) -> Result<String> {
-        if !req.region.contains(req.freq_hz) {
+        // FCC-800: the gateway side is 854–862 MHz; 809–817 MHz belongs to the devices.
+        if !req.region.tx_contains(req.freq_hz) {
             return Err(HalError::FrequencyOutOfBand {
                 freq_hz: req.freq_hz,
                 region: req.region,
             });
-        }
-        if req.region == Region::Fcc800 {
-            // shortcut: Semtech sx1250_calibrate covers 779–787, not 809–817.
-            return Err(HalError::Other(
-                "FCC-800 is 809–817 MHz; SX1250 CALIBRATE_IMAGE has no row for that window".into(),
-            ));
         }
         if req.region == Region::Ism2400 {
             // shortcut: SX1250 PLL is sub-GHz. ISM2400 needs an SX1280 (RAK5148's MCU protocol is not driven here).
@@ -895,6 +975,66 @@ mod tests {
         assert_eq!(rx["datr"], 50_000);
         assert!(rx.get("lsnr").is_none());
         assert_eq!(p.count_us, 1_000 - 7); // 680000/50000 - 20
+    }
+
+    /// `frame` plus fine-timestamp metrics and the timing-set flag.
+    fn fine_frame(chan: u8, flags: u8, payload: &[u8], ts: u32, metrics: &[i8]) -> Vec<u8> {
+        let size = payload.len();
+        let mut pkt = frame(chan, flags, payload, ts);
+        pkt[size + 9] |= 1 << 4; // timing_set
+        pkt[size + 21] = (metrics.len() / 2) as u8;
+        pkt.truncate(size + 22); // drop the old checksum
+        pkt.extend(metrics.iter().map(|m| *m as u8));
+        let sum = pkt.iter().fold(0u8, |a, x| a.wrapping_add(*x));
+        pkt.push(sum);
+        pkt
+    }
+
+    #[test]
+    fn precision_correction_matches_c() {
+        // SF7 BW125 CR4/5 CRC 12 B: ceil((96+16-28+8+20)/28)·5 = 20 symbols of 1024 µs,
+        // minus (18_031_250 + 500_000) / 1e6 = 18.53 µs, truncated.
+        assert_eq!(precision_timestamp_correction_us(BW_125KHZ, 7, 1, true, 12), 20_461);
+        // SF12 (DE on): ceil((96+16-48+8+20)/40)·5 = 15 symbols of 32768 µs.
+        // 491_520 − 18.53 = 491_501.47
+        assert_eq!(precision_timestamp_correction_us(BW_125KHZ, 12, 1, true, 12), 491_501);
+        // BW250 halves the symbol and the first filter term: 10_240 − (8_000_000 + 2_531_250) / 1e6.
+        assert_eq!(precision_timestamp_correction_us(BW_250KHZ, 7, 1, true, 12), 10_229);
+    }
+
+    #[test]
+    fn parse_fine_timestamp_metrics() {
+        let plan = ChannelPlan::as923_1_default();
+        let metrics = [3i8, -1, 2, -4];
+        let mut buf = fine_frame(3, 0x73, &[0xAA, 0xBB, 0xCC], 32_000 * 32, &metrics);
+        buf.extend(frame(2, 0x73, &[0x01], 40_000 * 32)); // the next frame still parses
+        let pkts = parse_rx_buffer_mode(&buf, &plan.chain_map(), true);
+        assert_eq!(pkts.len(), 2);
+        let p = &pkts[0];
+        assert!(p.timing_set);
+        assert_eq!(p.ts_metrics, metrics);
+        assert_eq!(p.payload, vec![0xAA, 0xBB, 0xCC]);
+        // end-of-header latch moved forward by the payload duration
+        let corr = precision_timestamp_correction_us(BW_125KHZ, 7, 1, true, 3);
+        assert!(corr > 0);
+        assert_eq!(p.count_us, 32_000 + corr as u32);
+        assert!(!pkts[1].timing_set && pkts[1].ts_metrics.is_empty());
+        // `ftime` appears in rxpk only once it was computed
+        assert!(p.to_rxpk().get("ftime").is_none());
+        let mut q = p.clone();
+        q.ftime_ns = Some(123_456_789);
+        assert_eq!(q.to_rxpk()["ftime"], 123_456_789);
+        // legacy mode keeps the old correction
+        let legacy = &parse_rx_buffer(&buf, &plan.chain_map())[0];
+        assert!(legacy.ts_correction_us < 0);
+    }
+
+    #[test]
+    fn freq_error_includes_if_register_step() {
+        // IF 400 kHz is programmed as 399_902 Hz: 98 Hz are added to the measured offset.
+        let e = pkt_freq_error(923_200_000, 1_000, 400_000);
+        assert!((e - 1_098.0 / 923_200_000.0).abs() < 1e-15);
+        assert_eq!(pkt_freq_error(923_200_000, 0, 0), 0.0);
     }
 
     #[test]

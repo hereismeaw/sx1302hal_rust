@@ -179,13 +179,24 @@ pub fn setup_rx(bus: &SpiBus, chain: RfChain, freq_hz: u32, single_input: bool) 
     Ok(())
 }
 
-/// Semtech `sx1250_calibrate` — 902–928 MHz uses 0xE1/0xE9 (covers AS923-1).
-fn calibrate_image(radio: &RadioPort<'_>, freq_hz: u32) -> Result<()> {
-    let (lo, hi) = if (902_000_000..928_000_000).contains(&freq_hz) {
-        (0xE1u8, 0xE9u8)
+/// CALIBRATE_IMAGE bytes for an RX frequency. 863–870 and 902–928 MHz are the
+/// rows of Semtech `sx1250_calibrate` (902–928 covers AS923-1). 809–817 MHz has
+/// no row there: its bytes follow Semtech `sx126x_cal_img_in_mhz`
+/// (sx126x_driver), one unit per 4 MHz, floor(809 / 4) and ceil(817 / 4).
+pub fn image_cal_bytes(freq_hz: u32) -> Option<(u8, u8)> {
+    if (902_000_000..928_000_000).contains(&freq_hz) {
+        Some((0xE1, 0xE9))
     } else if (863_000_000..870_000_000).contains(&freq_hz) {
-        (0xD7, 0xDB)
+        Some((0xD7, 0xDB))
+    } else if (809_000_000..=817_000_000).contains(&freq_hz) {
+        Some(((809u16 / 4) as u8, 817u16.div_ceil(4) as u8))
     } else {
+        None
+    }
+}
+
+fn calibrate_image(radio: &RadioPort<'_>, freq_hz: u32) -> Result<()> {
+    let Some((lo, hi)) = image_cal_bytes(freq_hz) else {
         return Err(HalError::Other(format!(
             "SX1250 CALIBRATE_IMAGE: no table for {freq_hz} Hz"
         )));
@@ -227,4 +238,20 @@ pub fn set_rx_continuous(bus: &SpiBus, chain: RfChain) -> Result<()> {
     let radio = bus.radio(chain.mux());
     radio.write_cmd(SET_RX, &[0xFF, 0xFF, 0xFF])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::image_cal_bytes;
+
+    #[test]
+    fn image_cal_rows() {
+        assert_eq!(image_cal_bytes(923_200_000), Some((0xE1, 0xE9)));
+        assert_eq!(image_cal_bytes(868_100_000), Some((0xD7, 0xDB)));
+        // 809–817 MHz: 0xCA·4 = 808 MHz, 0xCD·4 = 820 MHz
+        assert_eq!(image_cal_bytes(809_400_000), Some((0xCA, 0xCD)));
+        assert_eq!(image_cal_bytes(816_600_000), Some((0xCA, 0xCD)));
+        assert_eq!(image_cal_bytes(854_100_000), None);
+        assert_eq!(image_cal_bytes(433_000_000), None);
+    }
 }

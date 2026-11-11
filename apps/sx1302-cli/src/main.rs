@@ -59,12 +59,15 @@ enum Cmd {
         #[arg(long)]
         freq: Option<u32>,
     },
-    /// GPIO reset + radio + AGC/ARB. AS923-1, or US915 sub-band 2.
+    /// GPIO reset + radio + AGC/ARB. AS923-1, US915 or FCC-800.
     Start {
         #[arg(long, default_value = "/dev/spidev0.0")]
         spi: String,
         #[arg(long, default_value = "AS923-1")]
         region: String,
+        /// 0-based sub-band: US915 0–7 (default 1 = FSB2), FCC-800 0–4 (default 0).
+        #[arg(long)]
+        subband: Option<u8>,
     },
     /// Poll RX FIFO (raw bytes). Run after `start`.
     Rx {
@@ -110,8 +113,6 @@ enum Cmd {
         #[arg(long)]
         off: bool,
     },
-    /// Sample unused GPIOs as inputs (pairing button GPIO unknown).
-    Button,
 }
 
 #[derive(Subcommand)]
@@ -194,19 +195,12 @@ fn main() {
                 }
             }
         }
-        Cmd::Start { spi, region } => {
+        Cmd::Start { spi, region, subband } => {
             let region = Region::parse(&region).unwrap_or(Region::As923_1);
-            let plan = match region {
-                Region::As923_1 => ChannelPlan::as923_1_default(),
-                Region::Us915 => ChannelPlan::us915_sb2(),
-                Region::Fcc800 => {
-                    eprintln!(
-                        "FCC-800 is 809–817 MHz with no published channel plan, and this SX1250 has no image-cal row there"
-                    );
-                    std::process::exit(1);
-                }
-                _ => {
-                    eprintln!("start programs AS923-1 or US915 sub-band 2 only");
+            let plan = match ChannelPlan::preset(region, subband) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{e} (start programs AS923-1, US915 or FCC-800)");
                     std::process::exit(1);
                 }
             };
@@ -369,13 +363,6 @@ fn main() {
                 }
             }
         }
-        Cmd::Button => match sensecap_button::probe() {
-            Ok(r) => println!("{}", serde_json::to_string_pretty(&r).unwrap()),
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
-        },
     }
 }
 
