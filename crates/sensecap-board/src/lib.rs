@@ -122,6 +122,8 @@ pub const GPIOCHIP: &str = "/dev/gpiochip0";
 pub enum Carrier {
     /// WM1302 on the SenseCAP M1: GPIO18 power, GPIO17 reset, GPIO5 SX1262.
     SensecapM1,
+    /// Official Seeed WM1302 Pi HAT, SPI module. BCM18 is SX1262 BUSY input.
+    Wm1302PiHat,
     /// RAK2287 SPI (SX1302). mPCIe 3.3 V is always on. Reset is GPIO17, active high.
     Rak2287,
     /// RAK5146 SPI (SX1303). Same reset pin as the RAK2287 Pi HAT.
@@ -133,12 +135,13 @@ pub enum Carrier {
 impl Carrier {
     pub fn parse(s: &str) -> Result<Self, sx1302_core::HalError> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "" | "sensecap-m1" | "sensecap" | "wm1302" => Ok(Self::SensecapM1),
+            "" | "sensecap-m1" | "sensecap" => Ok(Self::SensecapM1),
+            "wm1302" | "wm1302-pi-hat" => Ok(Self::Wm1302PiHat),
             "rak2287" => Ok(Self::Rak2287),
             "rak5146" => Ok(Self::Rak5146),
             "rak5148" => Ok(Self::Rak5148),
             _ => Err(sx1302_core::HalError::Other(format!(
-                "unknown board {s} (sensecap-m1, rak2287, rak5146, rak5148)"
+                "unknown board {s} (sensecap-m1, wm1302-pi-hat, rak2287, rak5146, rak5148)"
             ))),
         }
     }
@@ -147,12 +150,64 @@ impl Carrier {
 pub fn reset_carrier(carrier: Carrier) -> Result<Vec<String>, sx1302_core::HalError> {
     match carrier {
         Carrier::SensecapM1 => reset_sensecap_m1(),
+        Carrier::Wm1302PiHat => reset_wm1302_pi_hat(),
         Carrier::Rak2287 | Carrier::Rak5146 => reset_rak_spi(carrier),
         Carrier::Rak5148 => Err(sx1302_core::HalError::Other(
             "RAK5148 is a 2.4 GHz SX1280 USB concentrator (STM32), not an SX1302/SX1303 SPI device"
                 .into(),
         )),
     }
+}
+
+/// Official HAT: release the M1 POWER_EN mapping, then reset the SPI module.
+/// BCM18 is an input on this carrier, never a power-enable output.
+#[cfg(target_os = "linux")]
+fn reset_wm1302_pi_hat() -> Result<Vec<String>, sx1302_core::HalError> {
+    use gpiocdev::Request;
+    use gpiocdev::line::Value;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    fn persist(args: &[&str]) -> Result<(), sx1302_core::HalError> {
+        let status = std::process::Command::new("pinctrl")
+            .args(args)
+            .status()
+            .map_err(|e| sx1302_core::HalError::Io(format!("pinctrl: {e}")))?;
+        if !status.success() {
+            return Err(sx1302_core::HalError::Io(format!("pinctrl {args:?}: {status}")));
+        }
+        Ok(())
+    }
+
+    persist(&["set", "18", "ip", "pn"])?;
+    let wait = Duration::from_millis(100);
+    let reset = Request::builder().on_chip(GPIOCHIP).with_line(17)
+        .as_output(Value::Active).request()
+        .map_err(|e| sx1302_core::HalError::Io(format!("GPIO17 RESET: {e}")))?;
+    sleep(wait);
+    reset.set_value(17, Value::Inactive)
+        .map_err(|e| sx1302_core::HalError::Io(format!("GPIO17 release: {e}")))?;
+    sleep(wait);
+    let aux = Request::builder().on_chip(GPIOCHIP).with_line(5)
+        .as_output(Value::Inactive).request()
+        .map_err(|e| sx1302_core::HalError::Io(format!("GPIO5 RESET: {e}")))?;
+    sleep(wait);
+    aux.set_value(5, Value::Active)
+        .map_err(|e| sx1302_core::HalError::Io(format!("GPIO5 release: {e}")))?;
+    sleep(wait);
+    drop((reset, aux));
+    persist(&["set", "17", "op", "dl"])?;
+    persist(&["set", "5", "op", "dh"])?;
+    Ok(vec![
+        "WM1302 Pi HAT: GPIO18 SX1262_BUSY = input (no POWER_EN)".into(),
+        "GPIO17 SX1302_RESET pulsed HIGH, released LOW".into(),
+        "GPIO5 SX1262_RESET pulsed LOW, released HIGH".into(),
+    ])
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reset_wm1302_pi_hat() -> Result<Vec<String>, sx1302_core::HalError> {
+    Err(sx1302_core::HalError::Unsupported("Linux gpiochip required"))
 }
 
 /// SenseCAP M1 concentrator GPIO sequence (skip BCM13).
@@ -383,6 +438,30 @@ pub fn inspect() -> BoardInspect {
     }
 }
 
+/// Inspect the official HAT without reporting the M1's POWER_EN and LED wiring.
+pub fn inspect_carrier(carrier: Carrier) -> BoardInspect {
+    let mut report = inspect();
+    if carrier == Carrier::Wm1302PiHat {
+        report.pins.retain(|p| !matches!(p.bcm, 13 | 22));
+        for p in &mut report.pins {
+            p.verification = VerificationStatus::CandidateFromDocs;
+            p.notes = "Seeed WM1302 Pi HAT SPI pin mapping; verify carrier revision".into();
+            if p.bcm == 18 {
+                p.signal = "SX1262_BUSY".into();
+                p.function = ElectricalFunction::BusyInput;
+                p.polarity = Polarity::ActiveHigh;
+                p.default_direction = Direction::Input;
+                p.safe_initial = "input-no-pull".into();
+            }
+        }
+        report.unverified_signals = report.pins.iter()
+            .map(|p| format!("{} BCM{} {:?}", p.signal, p.bcm, p.verification))
+            .collect();
+        report.readiness = "WM1302 Pi HAT SPI: GPIO17 reset, GPIO5 auxiliary reset, GPIO18 BUSY input. GPS uses the header UART; verify its device path.".into();
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,6 +480,24 @@ mod tests {
         assert_eq!(Carrier::parse("rak2287").unwrap(), Carrier::Rak2287);
         assert_eq!(Carrier::parse("RAK5146").unwrap(), Carrier::Rak5146);
         assert!(reset_carrier(Carrier::Rak5148).is_err());
+    }
+
+    #[test]
+    fn wm1302_is_not_the_m1_carrier() {
+        assert_eq!(Carrier::parse("wm1302").unwrap(), Carrier::Wm1302PiHat);
+        assert_eq!(Carrier::parse("WM1302-Pi-HAT").unwrap(), Carrier::Wm1302PiHat);
+        assert_eq!(Carrier::parse("sensecap-m1").unwrap(), Carrier::SensecapM1);
+        assert_eq!(Carrier::parse("").unwrap(), Carrier::SensecapM1);
+    }
+
+    #[test]
+    fn hat_busy_pin_is_not_an_output() {
+        let report = inspect_carrier(Carrier::Wm1302PiHat);
+        let busy = report.pins.iter().find(|p| p.bcm == 18).unwrap();
+        assert_eq!(busy.function, ElectricalFunction::BusyInput);
+        assert_eq!(busy.default_direction, Direction::Input);
+        assert!(may_drive(busy).is_err());
+        assert!(!report.pins.iter().any(|p| matches!(p.bcm, 13 | 22)));
     }
 
     #[test]

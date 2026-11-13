@@ -153,6 +153,26 @@ is the tested and supported one. This repo is for people who want a small
 Rust code base on an SX1302 + SX1250 SPI board and are ready to check it on
 their own hardware.
 
+## Seeed WM1302 Pi HAT (SPI)
+
+Use `"board": "wm1302-pi-hat"` for the official Seeed carrier. The alias
+`wm1302` also selects this carrier; use `sensecap-m1` for the M1.
+The Pi HAT reset pulses BCM17 high and BCM5 low. BCM18 is the SX1262 BUSY
+**input**, not the M1's power-enable output. The reset path requires `pinctrl`.
+See [Seeed's pin mapping](https://wiki.seeedstudio.com/WM1302_module/).
+
+[`configs/wm1302-pi-hat-as923.json`](configs/wm1302-pi-hat-as923.json) is a
+starting config for a 915 MHz SPI module using AS923-1. Keep your existing
+server list and channel plan when migrating a configured gateway.
+For manual reset/start, pass `--board wm1302-pi-hat` to `sx1302-cli`.
+
+On the tested Pi 5, GPS NMEA is on `/dev/ttyAMA0` at 9600 baud;
+`/dev/serial0` points to the separate debug UART (`ttyAMA10`). Verify the
+path on your OS. The daemon keeps host time until valid RMC and PPS arrive.
+Leave Class B off until PPS lock is verified. NMEA output with GGA fix quality
+0 or RMC status V means the GPS is communicating but has no position fix.
+If it reports `ANTENNA OPEN`, check the GPS antenna and connection.
+
 ## Building
 
 On the Pi (Rust 1.85 or newer):

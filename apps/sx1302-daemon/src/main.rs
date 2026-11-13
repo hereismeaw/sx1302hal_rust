@@ -91,7 +91,7 @@ struct Config {
     /// 1PPS is already wired to the concentrator. No fix yet: Class B keeps the host clock.
     #[serde(default)]
     gps: Option<String>,
-    /// `sensecap-m1` (default), `rak2287`, `rak5146`, or `rak5148`.
+    /// `sensecap-m1` (default), `wm1302-pi-hat`, `rak2287`, `rak5146`, or `rak5148`.
     #[serde(default)]
     board: Option<String>,
     /// Refuse any TX longer than this on air (AS923 dwell time is 400). Off when absent or 0.

@@ -95,7 +95,7 @@ impl Concentrator {
     fn identify(&self, radios: bool) -> Result<DetectReport> {
         let port = self.bus.sx1302();
         let mut notes = vec![
-            "Call `sx1302-cli gpio reset` to drive GPIO18 POWER_EN, GPIO17 RESET, GPIO5 SX126 RESET.".into(),
+            "For GPIO reset, select the carrier: `sx1302-cli --board <carrier> gpio reset` (e.g. wm1302-pi-hat or sensecap-m1).".into(),
             "GPIO13 AD5338R is never driven.".into(),
         ];
         let version = match port.probe_version() {

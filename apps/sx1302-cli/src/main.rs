@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use sensecap_board::{inspect, reset_sensecap_m1};
+use sensecap_board::{inspect_carrier, reset_carrier, Carrier};
 use sx1302_core::Region;
 use sx1302_firmware::{load_bin_or_var, AGC_FW, ARB_FW};
 use sx1302_hal::{ChannelPlan, Concentrator, TxRequest};
@@ -9,6 +9,9 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "sx1302-cli", about = "Native Rust SX1302 HAL diagnostics")]
 struct Cli {
+    /// Carrier reset wiring: sensecap-m1, wm1302-pi-hat, rak2287, or rak5146.
+    #[arg(long, global = true, default_value = "sensecap-m1")]
+    board: String,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -34,7 +37,7 @@ enum Cmd {
         #[arg(long, default_value_t = 2_000_000)]
         speed: u32,
     },
-    /// Drive SenseCAP M1 GPIO: POWER_EN 18, RESET 17, SX126 RESET 5. Never GPIO13.
+    /// Reset GPIOs for the selected --board carrier.
     Gpio {
         #[command(subcommand)]
         inner: GpioCmd,
@@ -127,14 +130,18 @@ enum GpioCmd {
 
 fn main() {
     let cli = Cli::parse();
+    let carrier = Carrier::parse(&cli.board).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
     match cli.cmd {
         Cmd::Board { inner: BoardCmd::Inspect } => {
-            let report = inspect();
+            let report = inspect_carrier(carrier);
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         }
         Cmd::Detect { spi, speed } => run_hal(spi, speed, false),
         Cmd::Bringup { spi, speed } => run_hal(spi, speed, true),
-        Cmd::Gpio { inner: GpioCmd::Reset } => match reset_sensecap_m1() {
+        Cmd::Gpio { inner: GpioCmd::Reset } => match reset_carrier(carrier) {
             Ok(notes) => {
                 for n in notes {
                     println!("{n}");
@@ -210,7 +217,10 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let _ = reset_sensecap_m1();
+            if let Err(e) = reset_carrier(carrier) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
             let cfg = SpiConfig {
                 path: spi,
                 ..Default::default()

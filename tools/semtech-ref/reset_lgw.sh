@@ -1,4 +1,7 @@
 #!/bin/sh
-# SenseCAP M1 reset via sx1302-cli (GPIO18 POWER_EN, GPIO17 RESET, GPIO5 SX1262 RESET; GPIO13 never driven)
-[ "$1" = start ] && /usr/local/bin/sx1302-cli gpio reset >/dev/null
+# Select the carrier explicitly for the official Seeed HAT:
+# SX1302_BOARD=wm1302-pi-hat ./lora_pkt_fwd ...
+if [ "$1" = start ]; then
+    exec /usr/local/bin/sx1302-cli --board "${SX1302_BOARD:-sensecap-m1}" gpio reset >/dev/null
+fi
 exit 0
