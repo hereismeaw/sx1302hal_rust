@@ -42,6 +42,17 @@ impl JitError {
         }
     }
 
+    /// Metrics label: one per refusal cause, dwell and collision kept apart.
+    pub fn label(self) -> &'static str {
+        match self {
+            JitError::TooLate => "too_late",
+            JitError::TooEarly => "too_early",
+            JitError::Collision => "collision",
+            JitError::Dwell => "dwell",
+            JitError::DutyCycle => "duty_cycle",
+        }
+    }
+
     pub fn reason(self) -> &'static str {
         match self {
             JitError::Dwell => "dwell time exceeded",

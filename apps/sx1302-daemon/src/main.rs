@@ -3,21 +3,25 @@
 
 mod gps;
 mod jit;
+mod metrics;
 mod notify;
+mod upstream;
+mod utc;
 
 use clap::Parser;
 use jit::JitQueue;
 use sensecap_board::{reset_carrier, Carrier};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::BTreeMap;
 use sx1302_core::Region;
 use sx1302_hal::{
     beacon_antenna, beacon_payload, bw_hz_to_code, count_at, gps_ms, next_beacon_gps_ms, ChannelPlan,
     Concentrator, FskTx, TxGainLut, TxRequest, TxTrigger, AS923_1_BEACON_HZ, BEACON_DELAY_US,
 };
 use sx1302_transport::SpiConfig;
-use std::net::UdpSocket;
 use std::thread;
+use upstream::{Uplink, Upstream, PKT_PULL_ACK, PKT_PULL_RESP};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
@@ -40,12 +44,26 @@ struct Args {
     /// TX air time allowed per sliding hour, in percent. 0 = no limit. Overrides the config.
     #[arg(long)]
     duty_cycle_percent: Option<f64>,
+    /// Prometheus endpoint, e.g. `0.0.0.0:9302`. Overrides the config.
+    #[arg(long)]
+    metrics: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
 struct Config {
     #[serde(default)]
     server: Option<String>,
+    /// More network servers. Every uplink and `stat` goes to each of them, and each
+    /// may send downlinks (TX_ACK goes back to the one that asked).
+    #[serde(default)]
+    servers: Vec<String>,
+    /// Uplinks kept per server while it does not answer (PUSH_DATA messages,
+    /// default 2000, 0 = drop like `lora_pkt_fwd`). Joins are never kept.
+    #[serde(default)]
+    uplink_buffer: Option<usize>,
+    /// Prometheus endpoint (`host:port`). Off when absent.
+    #[serde(default)]
+    metrics: Option<String>,
     #[serde(default)]
     stat_interval: Option<u64>,
     #[serde(default)]
@@ -141,25 +159,59 @@ struct GpsLock {
     at: Instant,
 }
 
-const PKT_PUSH_DATA: u8 = 0x00;
-const PKT_PUSH_ACK: u8 = 0x01;
-const PKT_PULL_DATA: u8 = 0x02;
-const PKT_PULL_RESP: u8 = 0x03;
-const PKT_PULL_ACK: u8 = 0x04;
-const PKT_TX_ACK: u8 = 0x05;
-const PROTO: u8 = 0x02;
-
+/// Counts for one `stat` interval.
 #[derive(Default)]
 struct Stats {
     rxnb: u32,
     rxok: u32,
     rxfw: u32,
-    push_sent: u32,
-    push_ack: u32,
     dwnb: u32,
     txnb: u32,
     /// Downlinks refused because the JIT window overlapped a queued packet.
     coll: u32,
+}
+
+/// Counts since start, for the metrics page.
+#[derive(Default)]
+struct Totals {
+    rx: u64,
+    rx_ok: u64,
+    rx_fwd: u64,
+    dl: u64,
+    tx: u64,
+    tx_arm_err: u64,
+    /// Refused downlinks by reason (`too_late`, `duty_cycle`, `TX_FREQ`, ...).
+    refused: BTreeMap<&'static str, u64>,
+    beacons: u64,
+    hops: u64,
+}
+
+/// The server list: `--server` (or `server`) first, then `servers`, without repeats.
+fn server_list(first: Option<String>, more: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in first.into_iter().chain(more.iter().cloned()) {
+        let s = s.trim().to_string();
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// systemd STATUS link part. The single-server strings are what the soak sampler logs.
+fn link_status(ups: &[Upstream]) -> String {
+    let up = ups.iter().filter(|u| !u.lost).count();
+    let backlog: usize = ups.iter().map(|u| u.spool.backlog_len()).sum();
+    let mut s = match (ups.len(), up) {
+        (0, _) => "no server".to_string(),
+        (n, u) if u == n => "server ok".to_string(),
+        (1, _) => "no server ACK > 30 s".to_string(),
+        (n, u) => format!("{u}/{n} servers ok"),
+    };
+    if backlog > 0 {
+        s += &format!(", backlog {backlog}");
+    }
+    s
 }
 
 fn main() {
@@ -176,7 +228,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("config {p}: {e}"))?,
         None => Config::default(),
     };
-    let server = args.server.or(cfg.server).unwrap_or_default();
+    let servers = server_list(args.server.or(cfg.server), &cfg.servers);
+    let uplink_buffer = cfg.uplink_buffer.unwrap_or(upstream::DEFAULT_BUFFER);
+    let metrics_addr = args.metrics.or(cfg.metrics).filter(|a| !a.is_empty());
     let stat_interval = args.stat_interval.or(cfg.stat_interval).unwrap_or(30);
     let plan = match (cfg.plan, cfg.region.as_deref()) {
         (Some(p), _) => p,
@@ -219,15 +273,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let eui = c.otp_eui().unwrap_or(0);
     eprintln!("gateway EUI {eui:016x}");
-    let sock = if server.is_empty() {
-        None
-    } else {
-        let s = UdpSocket::bind("0.0.0.0:0")?;
-        s.set_nonblocking(true)?;
-        s.connect(&server)?;
+    let mut ups: Vec<Upstream> = Vec::new();
+    for server in &servers {
+        ups.push(Upstream::connect(server, uplink_buffer).map_err(|e| format!("server {server}: {e}"))?);
         eprintln!("PUSH_DATA/PULL_DATA -> {server}");
-        Some(s)
+    }
+    if !ups.is_empty() {
+        eprintln!("uplink buffer: {uplink_buffer} messages per server while it does not answer (joins are not kept)");
+    }
+    let metrics = match &metrics_addr {
+        Some(a) => {
+            let m = metrics::MetricsServer::bind(a).map_err(|e| format!("metrics {a}: {e}"))?;
+            eprintln!("metrics on http://{a}/metrics");
+            Some(m)
+        }
+        None => None,
     };
+    let mut tot = Totals::default();
+    let mut last_temp: Option<f32> = None;
     let mut st = Stats::default();
     let mut jit = JitQueue::default();
     let mut air = jit::Airtime::new(dwell_ms, duty_cycle_percent);
@@ -264,14 +327,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_rtc = Instant::now() - Duration::from_secs(3600);
     let mut token: u16 = 1;
     let mut last_stat = Instant::now();
-    let mut last_pull = Instant::now() - Duration::from_secs(10);
-    let mut pull_acked = false;
     // systemd watchdog: ping at half the interval, only after a passing health check.
     let wd_every = notify::watchdog_interval().map(|d| d / 2);
     let mut last_health = Instant::now();
     let mut health_ts = Some(c.health_check(None)?);
-    let mut last_server_ack = Instant::now();
-    let mut server_lost = false;
     // Test hook: answer TOO_LATE to every other PULL_RESP so the network server
     // falls back to RX2 (exercises RX2 / JoinAccept-RX2 end to end). Never set in production.
     let reject_alternate = std::env::var_os("SX1302_TEST_REJECT_ALTERNATE_DL").is_some();
@@ -304,12 +363,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             jit.expire(ts);
             last_health = Instant::now();
             let temp = read_temp(&c);
+            last_temp = temp;
             if wd_every.is_some() {
-                let link = if sock.is_none() || last_server_ack.elapsed() < Duration::from_secs(30) {
-                    "server ok"
-                } else {
-                    "no server ACK > 30 s"
-                };
+                let link = link_status(&ups);
                 let temp = temp.map_or("n/a".into(), |t| format!("{t:.1} °C"));
                 notify::notify(&format!(
                     "WATCHDOG=1\nSTATUS={link}, jit queue {}, board {temp}",
@@ -321,6 +377,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if !dump.packets.is_empty() {
             st.rxnb += dump.packets.len() as u32;
             st.rxok += dump.packets.iter().filter(|p| p.stat == 1).count() as u32;
+            tot.rx += dump.packets.len() as u64;
+            tot.rx_ok += dump.packets.iter().filter(|p| p.stat == 1).count() as u64;
             // Like lora_pkt_fwd: forward CRC-OK only. The multi-SF chain and the LoRa
             // service modem can both demodulate one frame: keep the best-SNR copy.
             // SX1303 dual demodulation also gives two copies: like `lgw_receive`,
@@ -351,12 +409,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let rxpk: Vec<_> = ok.iter().map(|p| p.to_rxpk()).collect();
             if !rxpk.is_empty() {
                 last_rx = Instant::now();
-                let body = json!({ "rxpk": rxpk });
-                eprintln!("{body}");
-                if let Some(s) = &sock {
-                    soft(push(s, token, eui, &body.to_string()), "PUSH_DATA rxpk");
-                    st.rxfw += rxpk.len() as u32;
-                    st.push_sent += 1;
+                eprintln!("{}", json!({ "rxpk": rxpk }));
+                if !ups.is_empty() {
+                    let u = Uplink {
+                        keep: ok.iter().map(|p| upstream::replayable_phy(&p.payload)).collect(),
+                        rxpk,
+                        unix_ms: unix_now_ms(),
+                    };
+                    st.rxfw += u.rxpk.len() as u32;
+                    tot.rx_fwd += u.rxpk.len() as u64;
+                    for up in ups.iter_mut() {
+                        up.send_rxpk(token, eui, u.clone());
+                    }
                     token = token.wrapping_add(1);
                 }
             }
@@ -465,14 +529,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         last_beacon_ms = boundary;
                         let mono_ms = started.elapsed().as_millis() as u64;
                         match submit(&mut jit, &mut air, req, Some(at), now, jit::MAX_AHEAD_CLASS_B_US, mono_ms) {
-                            Ok(()) => eprintln!(
-                                "class B beacon queued gps_ms={boundary} tmst={at} (+{} ms)",
-                                ahead / 1000
-                            ),
+                            Ok(()) => {
+                                tot.beacons += 1;
+                                eprintln!(
+                                    "class B beacon queued gps_ms={boundary} tmst={at} (+{} ms)",
+                                    ahead / 1000
+                                )
+                            }
                             Err(e) => {
                                 if e == jit::JitError::Collision {
                                     st.coll += 1;
                                 }
+                                *tot.refused.entry(e.label()).or_default() += 1;
                                 eprintln!("class B beacon gps_ms={boundary} skipped: {}", e.reason());
                             }
                         }
@@ -489,9 +557,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 match c.send(&item.req) {
                     Ok(msg) => {
                         st.txnb += 1;
+                        tot.tx += 1;
                         eprintln!("{msg} [armed in {} µs, queue {}]", t0.elapsed().as_micros(), jit.len());
                     }
-                    Err(e) => eprintln!("jit arm: {e}"),
+                    Err(e) => {
+                        tot.tx_arm_err += 1;
+                        eprintln!("jit arm: {e}")
+                    }
                 }
             }
         }
@@ -521,6 +593,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 health_ts = None;
                 h.idx = next;
                 h.since = Instant::now();
+                tot.hops += 1;
                 let [a, b] = h.plans[next].radio_hz;
                 eprintln!(
                     "hop {}/{}: radios {a}/{b} Hz (restart took {} ms)",
@@ -531,64 +604,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if let Some(s) = &sock {
-            if last_stat.elapsed() > Duration::from_secs(stat_interval) {
-                let ackr = if st.push_sent == 0 {
-                    100.0
-                } else {
-                    (100.0 * f64::from(st.push_ack) / f64::from(st.push_sent)).min(100.0)
-                };
-                let stat = stat_json(
-                    &gwmp_time(),
-                    &st,
-                    (ackr * 10.0).round() / 10.0,
-                    read_temp(&c),
-                    if gps_lock.is_some() { "pps" } else { "host" },
-                );
-                eprintln!("{stat}");
-                soft(push(s, token, eui, &stat.to_string()), "PUSH_DATA stat");
-                st = Stats {
-                    push_sent: st.push_sent + 1,
-                    push_ack: st.push_ack,
-                    ..Stats::default()
-                };
-                token = token.wrapping_add(1);
-                last_stat = Instant::now();
-            }
-            if last_pull.elapsed() > Duration::from_secs(5) {
-                soft(s.send(&gwmp_hdr(PKT_PULL_DATA, token, eui)).map(|_| ()), "PULL_DATA");
-                token = token.wrapping_add(1);
-                last_pull = Instant::now();
-            }
-            if !server_lost && last_server_ack.elapsed() > Duration::from_secs(30) {
-                eprintln!("server {server}: no ACK for 30 s (link down?), still receiving RF");
-                server_lost = true;
-            }
-            let mut buf = [0u8; 65536];
-            while let Ok(n) = s.recv(&mut buf) {
-                if n < 4 || buf[0] != PROTO {
-                    continue;
+        if !ups.is_empty() && last_stat.elapsed() > Duration::from_secs(stat_interval) {
+            let temp = read_temp(&c);
+            let time = gwmp_time();
+            let time_src = if gps_lock.is_some() { "pps" } else { "host" };
+            for (i, up) in ups.iter_mut().enumerate() {
+                let stat = stat_json(&time, &st, up.ackr(), temp, time_src);
+                // One log line per stat interval (the first server's ackr) keeps the journal as before.
+                if i == 0 {
+                    eprintln!("{stat}");
                 }
-                if matches!(buf[3], PKT_PUSH_ACK | PKT_PULL_ACK | PKT_PULL_RESP) {
-                    if server_lost {
-                        eprintln!(
-                            "server {server} back after {} s",
-                            last_server_ack.elapsed().as_secs()
-                        );
-                        server_lost = false;
-                    }
-                    last_server_ack = Instant::now();
-                }
+                up.send_stat(token, eui, &stat.to_string());
+            }
+            st = Stats::default();
+            token = token.wrapping_add(1);
+            last_stat = Instant::now();
+        }
+        let mut buf = [0u8; 65536];
+        for up in ups.iter_mut() {
+            up.tick(&mut token, eui);
+            while let Some(n) = up.recv(&mut buf) {
                 match buf[3] {
-                    PKT_PUSH_ACK => st.push_ack += 1,
-                    PKT_PULL_ACK => {
-                        if !pull_acked {
-                            eprintln!("PULL_ACK from {server} (downlink path open)");
-                            pull_acked = true;
-                        }
+                    PKT_PULL_ACK if !up.pull_acked => {
+                        eprintln!("PULL_ACK from {} (downlink path open)", up.addr);
+                        up.pull_acked = true;
                     }
                     PKT_PULL_RESP => {
                         st.dwnb += 1;
+                        tot.dl += 1;
                         let resp_token = u16::from_be_bytes([buf[1], buf[2]]);
                         let json = std::str::from_utf8(&buf[4..n]).unwrap_or("");
                         eprintln!("PULL_RESP {json}");
@@ -624,21 +667,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         if e == jit::JitError::Collision {
                                             st.coll += 1;
                                         }
+                                        *tot.refused.entry(e.label()).or_default() += 1;
                                         eprintln!("jit: {}", e.reason());
                                         e.gwmp()
                                     }
                                 }
                             }
                             Err(e) => {
+                                *tot.refused.entry(e).or_default() += 1;
                                 eprintln!("txpk: {e}");
                                 e
                             }
                         };
-                        soft(tx_ack(s, resp_token, eui, err), "TX_ACK");
+                        up.tx_ack(resp_token, eui, err);
                     }
                     _ => {}
                 }
             }
+        }
+        if let Some(m) = &metrics {
+            m.poll(|| {
+                render_metrics(
+                    &tot,
+                    &ups,
+                    jit.len(),
+                    last_temp,
+                    gps_lock.is_some(),
+                    started.elapsed().as_secs(),
+                    hop.as_ref().map(|h| h.idx),
+                )
+            });
         }
         thread::sleep(Duration::from_millis(5));
     }
@@ -663,34 +721,64 @@ fn submit(
     Ok(())
 }
 
-/// Network errors (ECONNREFUSED from a dead server, ENETUNREACH while the link is
-/// down, ...) must not kill the concentrator: log at most every 30 s and carry on.
-fn soft(r: std::io::Result<()>, what: &str) {
-    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
-    if let Err(e) = r {
-        let mut last = LAST.lock().unwrap();
-        if last.is_none_or(|t| t.elapsed() > Duration::from_secs(30)) {
-            eprintln!("{what}: {e} (continuing; packets dropped until the server is reachable)");
-            *last = Some(Instant::now());
-        }
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The Prometheus page. Counters are since daemon start.
+fn render_metrics(
+    tot: &Totals,
+    ups: &[Upstream],
+    jit_len: usize,
+    temp: Option<f32>,
+    pps: bool,
+    uptime_s: u64,
+    hop_idx: Option<usize>,
+) -> String {
+    let mut p = metrics::Page::default();
+    p.gauge("uptime_seconds", "Seconds since the daemon started.", uptime_s as f64)
+        .counter("rx_packets_total", "Frames read from the RX FIFO, CRC good or bad.", tot.rx)
+        .counter("rx_crc_ok_total", "Frames with a good CRC.", tot.rx_ok)
+        .counter("rx_forwarded_total", "rxpk sent upstream after dropping duplicate copies.", tot.rx_fwd)
+        .counter("downlink_requests_total", "PULL_RESP received from all servers.", tot.dl)
+        .counter("tx_total", "Packets armed on the concentrator.", tot.tx)
+        .counter("tx_arm_errors_total", "Packets the concentrator refused to arm.", tot.tx_arm_err)
+        .counter("beacons_total", "Class B beacons queued.", tot.beacons)
+        .counter("hops_total", "Channel-block hops.", tot.hops)
+        .gauge("jit_queue_length", "Downlinks waiting in the JIT queue.", jit_len as f64)
+        .gauge("time_source_pps", "1 while a GPS PPS lock sets the time, 0 on the host clock.", f64::from(u8::from(pps)));
+    let refused: Vec<(String, f64)> =
+        tot.refused.iter().map(|(r, n)| (format!("reason=\"{}\"", metrics::label(r)), *n as f64)).collect();
+    let refused: Vec<(&str, f64)> = refused.iter().map(|(l, v)| (l.as_str(), *v)).collect();
+    p.family("tx_refused_total", "counter", "Downlinks refused, by reason.", &refused);
+    if let Some(t) = temp {
+        p.gauge("board_temperature_celsius", "STTS751 board temperature.", f64::from(t));
     }
-}
-
-fn gwmp_hdr(ident: u8, token: u16, eui: u64) -> Vec<u8> {
-    let mut pkt = Vec::with_capacity(12);
-    pkt.push(PROTO);
-    pkt.extend_from_slice(&token.to_be_bytes());
-    pkt.push(ident);
-    pkt.extend_from_slice(&eui.to_be_bytes());
-    pkt
-}
-
-/// TX_ACK must echo the PULL_RESP token (PROTOCOL.md §6.2).
-fn tx_ack(sock: &UdpSocket, token: u16, eui: u64, error: &str) -> std::io::Result<()> {
-    let mut pkt = gwmp_hdr(PKT_TX_ACK, token, eui);
-    pkt.extend_from_slice(json!({ "txpk_ack": { "error": error } }).to_string().as_bytes());
-    sock.send(&pkt)?;
-    Ok(())
+    if let Some(i) = hop_idx {
+        p.gauge("hop_block", "Channel block in use (0-based).", i as f64);
+    }
+    let labels: Vec<String> = ups.iter().map(|u| format!("server=\"{}\"", metrics::label(&u.addr))).collect();
+    let mut per = |name: &str, kind: &str, help: &str, f: &dyn Fn(&Upstream) -> f64| {
+        let s: Vec<(&str, f64)> = labels.iter().zip(ups).map(|(l, u)| (l.as_str(), f(u))).collect();
+        p.family(name, kind, help, &s);
+    };
+    per("server_up", "gauge", "1 while the server answers.", &|u| f64::from(u8::from(!u.lost)));
+    per("server_ack_ratio_percent", "gauge", "PUSH_ACK per PUSH_DATA since start.", &|u| u.ackr());
+    per("server_push_sent_total", "counter", "PUSH_DATA sent.", &|u| u.push_sent as f64);
+    per("server_push_ack_total", "counter", "PUSH_ACK received.", &|u| u.push_ack as f64);
+    per("server_outages_total", "counter", "Times the server stopped answering for 30 s.", &|u| u.outages as f64);
+    per("uplink_backlog", "gauge", "PUSH_DATA messages waiting for the server.", &|u| u.spool.backlog_len() as f64);
+    per("uplink_replayed_total", "counter", "rxpk sent late from the backlog.", &|u| u.spool.replayed as f64);
+    per(
+        "uplink_dropped_total",
+        "counter",
+        "rxpk lost: backlog full or off, or a join that cannot wait.",
+        &|u| u.spool.dropped as f64,
+    );
+    p.finish()
 }
 
 /// GWMP `txpk` -> request, emission time (`None` = immediate), and the JIT horizon.
@@ -814,13 +902,6 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, &'static str> {
     Ok(out)
 }
 
-fn push(sock: &UdpSocket, token: u16, eui: u64, json: &str) -> std::io::Result<()> {
-    let mut pkt = gwmp_hdr(PKT_PUSH_DATA, token, eui);
-    pkt.extend_from_slice(json.as_bytes());
-    sock.send(&pkt)?;
-    Ok(())
-}
-
 /// GWMP `stat`. `temp` is the STTS751 reading. `time_src` is `pps` after a
 /// PPS+RMC lock and `host` otherwise. `coll` counts JIT collisions.
 fn stat_json(time: &str, st: &Stats, ackr: f64, temp: Option<f32>, time_src: &str) -> serde_json::Value {
@@ -846,28 +927,7 @@ fn gwmp_time() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    format_utc(secs)
-}
-
-fn format_utc(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let tod = secs % 86_400;
-    // Howard Hinnant civil_from_days
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} GMT",
-        tod / 3600,
-        (tod / 60) % 60,
-        tod % 60
-    )
+    utc::format_utc(secs)
 }
 
 #[cfg(test)]
@@ -875,9 +935,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn utc_format() {
-        assert_eq!(format_utc(0), "1970-01-01 00:00:00 GMT");
-        assert_eq!(format_utc(1_709_210_096), "2024-02-29 12:34:56 GMT");
+    fn servers_and_status() {
+        let l = server_list(Some("a:1700".into()), &["b:1700".into(), "a:1700".into(), " ".into()]);
+        assert_eq!(l, ["a:1700", "b:1700"]);
+        assert!(server_list(None, &[]).is_empty());
+        assert_eq!(link_status(&[]), "no server");
+        let mut a = Upstream::connect("127.0.0.1:9", 4).unwrap();
+        assert_eq!(link_status(std::slice::from_ref(&a)), "server ok");
+        a.lost = true;
+        assert_eq!(link_status(std::slice::from_ref(&a)), "no server ACK > 30 s");
+        let b = Upstream::connect("127.0.0.1:9", 4).unwrap();
+        assert_eq!(link_status(&[a, b]), "1/2 servers ok");
+    }
+
+    #[test]
+    fn metrics_page_lists_servers() {
+        let mut tot = Totals { rx: 5, ..Default::default() };
+        tot.refused.insert("duty_cycle", 2);
+        let up = Upstream::connect("127.0.0.1:9", 4).unwrap();
+        let s = render_metrics(&tot, &[up], 1, Some(37.5), false, 60, None);
+        assert!(s.contains("sx1302_rx_packets_total 5\n"));
+        assert!(s.contains("sx1302_tx_refused_total{reason=\"duty_cycle\"} 2\n"));
+        assert!(s.contains("sx1302_server_up{server=\"127.0.0.1:9\"} 1\n"));
+        assert!(s.contains("sx1302_board_temperature_celsius 37.5\n"));
+        assert!(!s.contains("hop_block"));
     }
 
     #[test]

@@ -86,6 +86,14 @@ The daemon config takes `"region"` and `"subband"` in place of a full `"plan"`. 
 
 `"dwell_ms"` and `"duty_cycle_percent"` (or `--dwell-ms` / `--duty-cycle-percent`) limit transmit air time. Both are off when absent or 0. A downlink refused for duty cycle is answered `DUTY_CYCLE_OVERFLOW` (a ChirpStack `TxAckStatus` name, not in Semtech's PROTOCOL.md). A downlink refused for dwell time is answered `COLLISION_PACKET`, because neither list has a dwell code.
 
+`"servers"` adds more network servers next to `"server"`, for example `"servers": ["eu1.cloud.thethings.network:1700"]`. Every uplink and `stat` goes to each one, and each may send downlinks. The TX_ACK goes back to the server that asked, and all of them share one JIT queue. Each server must know the gateway EUI.
+
+When a server stops answering (no PUSH_ACK for 5 s, or no ACK of any kind for 30 s), its uplinks are kept, up to `"uplink_buffer"` PUSH_DATA messages per server (default 2000, `0` drops them like `lora_pkt_fwd`). The oldest go first when the buffer is full. Once the server answers again, the backlog goes out in receive order, 20 messages a second, before any new uplink. Each late `rxpk` carries a `time` field from when it was received. JoinRequest and Rejoin-Request are never kept, because a late one could make the server start a session the device never sees. Downlinks for late uplinks come too late and are answered `TOO_LATE`. The buffer is in memory, so a daemon restart empties it.
+
+`"metrics": "0.0.0.0:9302"` (or `--metrics`) serves Prometheus text at `/metrics`. It covers RX/TX counters, refused downlinks by reason, the JIT queue, board temperature, the time source, and, per server, link state, ACK ratio, outages, backlog, replayed and dropped uplinks. It is off when absent.
+
+There is no TX on radio B. On the SenseCAP M1, as in every Semtech SX1250 reference config, `radio_1` has `tx_enable: false`. Only radio A is wired to the PA.
+
 The GWMP `stat` object adds `temp` (STTS751, degrees C), `time_src` (`pps` or `host`), and `coll` (downlinks dropped because the transmit queue overlapped). A RAK5146 turns on SX1303 fine timestamp. Semtech's AGC v10 image is the firmware for both the SX1302 and the SX1303 when the front-end is an SX1250.
 
 Two things that cost me time:
@@ -121,6 +129,9 @@ far more hardware. This table is against v2.1.0.
 | LBT and spectral scan (SX1261) | Yes | No |
 | Full duplex (CN490 reference design) | Yes | No |
 | Dwell-time and duty-cycle limits on TX | No | Optional, off by default |
+| More than one network server | No, one `server_address` | Yes (`"servers"`) |
+| Uplinks kept while the server is unreachable | No, dropped | Yes, in memory, data frames only |
+| Metrics endpoint | No | Prometheus text, optional |
 | Hopping one concentrator over several channel blocks | No | Optional (`"hop"`) |
 | Setting the host clock and RTC from GPS | No | Yes, when a GPS port is configured |
 | Service supervision | Left to the integrator | systemd unit with a watchdog and a chip health check |
