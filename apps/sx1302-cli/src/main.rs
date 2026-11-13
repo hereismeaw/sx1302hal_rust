@@ -196,7 +196,13 @@ fn main() {
             }
         }
         Cmd::Start { spi, region, subband } => {
-            let region = Region::parse(&region).unwrap_or(Region::As923_1);
+            let region = match Region::parse(&region) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            };
             let plan = match ChannelPlan::preset(region, subband) {
                 Ok(p) => p,
                 Err(e) => {

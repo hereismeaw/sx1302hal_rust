@@ -84,7 +84,7 @@ Treat the FCC-800 plan as a placeholder. I do not know this band, and the channe
 
 The daemon config takes `"region"` and `"subband"` in place of a full `"plan"`. `"hop"` makes one concentrator listen to several blocks in turn, for example all eight US915 sub-bands: `"region": "US915", "subband": 0, "hop": {"dwell_s": 20, "step_hz": 1600000, "steps": 8}`. AS923-1 has room for two blocks in 920–925 MHz: `"hop": {"dwell_s": 20, "shift_hz": [0, -1600000]}`. Each hop is a GPIO reset and a full start, and uplinks on the other blocks are missed while the gateway sits on one.
 
-`"dwell_ms"` and `"duty_cycle_percent"` (or `--dwell-ms` / `--duty-cycle-percent`) limit transmit air time. Both are off when absent or 0.
+`"dwell_ms"` and `"duty_cycle_percent"` (or `--dwell-ms` / `--duty-cycle-percent`) limit transmit air time. Both are off when absent or 0. A downlink refused for duty cycle is answered `DUTY_CYCLE_OVERFLOW` (a ChirpStack `TxAckStatus` name, not in Semtech's PROTOCOL.md). A downlink refused for dwell time is answered `COLLISION_PACKET`, because neither list has a dwell code.
 
 The GWMP `stat` object adds `temp` (STTS751, degrees C), `time_src` (`pps` or `host`), and `coll` (downlinks dropped because the transmit queue overlapped). A RAK5146 turns on SX1303 fine timestamp. Semtech's AGC v10 image is the firmware for both the SX1302 and the SX1303 when the front-end is an SX1250.
 

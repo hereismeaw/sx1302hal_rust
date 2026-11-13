@@ -29,13 +29,16 @@ pub enum JitError {
 }
 
 impl JitError {
-    /// GWMP `txpk_ack.error`. PROTOCOL.md has no dwell / duty-cycle code, so those
-    /// two go out as `COLLISION_PACKET`; [`JitError::reason`] is what the log shows.
+    /// GWMP `txpk_ack.error`. Semtech's PROTOCOL.md has no duty-cycle code, but
+    /// ChirpStack maps the name onto `gw.TxAckStatus`, which has `DUTY_CYCLE_OVERFLOW`.
+    /// Nothing there means dwell time, so a dwell refusal stays `COLLISION_PACKET`.
+    /// [`JitError::reason`] is what the log shows.
     pub fn gwmp(self) -> &'static str {
         match self {
             JitError::TooLate => "TOO_LATE",
             JitError::TooEarly => "TOO_EARLY",
-            JitError::Collision | JitError::Dwell | JitError::DutyCycle => "COLLISION_PACKET",
+            JitError::DutyCycle => "DUTY_CYCLE_OVERFLOW",
+            JitError::Collision | JitError::Dwell => "COLLISION_PACKET",
         }
     }
 
@@ -290,7 +293,8 @@ mod tests {
         // the first frame leaves the window one hour after it was sent
         assert_eq!(duty.check(DUTY_WINDOW_MS - 1, toa12), Err(JitError::DutyCycle));
         assert!(duty.check(DUTY_WINDOW_MS, toa12).is_ok());
-        assert_eq!(JitError::DutyCycle.gwmp(), "COLLISION_PACKET");
+        assert_eq!(JitError::DutyCycle.gwmp(), "DUTY_CYCLE_OVERFLOW");
+        assert_eq!(JitError::Dwell.gwmp(), "COLLISION_PACKET");
     }
 
     #[test]

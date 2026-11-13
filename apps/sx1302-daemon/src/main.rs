@@ -352,7 +352,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if !rxpk.is_empty() {
                 last_rx = Instant::now();
                 let body = json!({ "rxpk": rxpk });
-                println!("{body}");
+                eprintln!("{body}");
                 if let Some(s) = &sock {
                     soft(push(s, token, eui, &body.to_string()), "PUSH_DATA rxpk");
                     st.rxfw += rxpk.len() as u32;
